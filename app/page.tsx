@@ -1,91 +1,69 @@
 import { GraphBlob } from "@/components/GraphBlob"
-import Link from "next/link"
+import { FaGithub, FaLinkedin, FaXTwitter, FaEnvelope } from "react-icons/fa6"
 
 export default function Home() {
   return (
-    <div className="min-h-screen flex items-center justify-center px-6">
-      <div className="w-full max-w-6xl grid lg:grid-cols-[1fr,1.2fr] gap-16 items-start">
+    <div className="min-h-screen flex items-start justify-center px-6 pt-20">
+      <div className="w-full max-w-6xl grid lg:grid-cols-2 gap-20 items-start">
         {/* Left side - Content */}
-        <div className="max-w-md">
-          {/* Header with name and social links */}
-          <header className="mb-12">
-            <h1 className="text-3xl font-bold mb-4 text-black dark:text-white">
-              Jacob Lee
+        <div className="max-w-md justify-self-end pt-12">
+          {/* Header with name */}
+          <header className="mb-8">
+            <h1 className="text-3xl font-bold text-black dark:text-white">
+              Jake Lee
             </h1>
-            <div className="flex gap-4 text-sm">
+          </header>
+
+          {/* About text without heading */}
+          <section className="mb-8">
+            <p className="text-gray-700 dark:text-gray-300 leading-relaxed">
+              I&apos;m interested in lots of data things (see right for more). Studied Statistics and Quantitative Analysis at the University of Utah. Currently doing analytics at Domo.
+            </p>
+          </section>
+
+          {/* Social links */}
+          <section>
+            <div className="flex flex-col gap-2">
               <a
-                href="https://github.com/JakeLee13"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-gray-600 dark:text-gray-400 hover:text-black dark:hover:text-white underline"
+                href="mailto:jacob.g.lee13@gmail.com"
+                className="flex items-center gap-2 group"
               >
-                GitHub
-              </a>
-              <a
-                href="https://www.linkedin.com/in/jake-lee-219a3a220/"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-gray-600 dark:text-gray-400 hover:text-black dark:hover:text-white underline"
-              >
-                LinkedIn
+                <FaEnvelope className="w-5 h-5 flex-shrink-0 text-gray-600 dark:text-gray-400" />
+                <span className="text-sm text-blue-600 dark:text-blue-400 group-hover:text-blue-800 dark:group-hover:text-blue-300 transition-colors">jacob.g.lee13@gmail.com</span>
               </a>
               <a
                 href="https://x.com/indeski_"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-gray-600 dark:text-gray-400 hover:text-black dark:hover:text-white underline"
+                className="flex items-center gap-2 group"
               >
-                X
+                <FaXTwitter className="w-5 h-5 flex-shrink-0 text-gray-600 dark:text-gray-400" />
+                <span className="text-sm text-blue-600 dark:text-blue-400 group-hover:text-blue-800 dark:group-hover:text-blue-300 transition-colors">@indeski_</span>
+              </a>
+              <a
+                href="https://www.linkedin.com/in/jake-lee-219a3a220/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 group"
+              >
+                <FaLinkedin className="w-5 h-5 flex-shrink-0 text-gray-600 dark:text-gray-400" />
+                <span className="text-sm text-blue-600 dark:text-blue-400 group-hover:text-blue-800 dark:group-hover:text-blue-300 transition-colors">jake-lee</span>
+              </a>
+              <a
+                href="https://github.com/JakeLee13"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 group"
+              >
+                <FaGithub className="w-5 h-5 flex-shrink-0 text-gray-600 dark:text-gray-400" />
+                <span className="text-sm text-blue-600 dark:text-blue-400 group-hover:text-blue-800 dark:group-hover:text-blue-300 transition-colors">JakeLee13</span>
               </a>
             </div>
-          </header>
-
-          {/* About */}
-          <section className="mb-10">
-            <h2 className="text-xl font-semibold mb-3 text-black dark:text-white">About</h2>
-            <p className="text-gray-700 dark:text-gray-300 leading-relaxed mb-3">
-              I&apos;m a software engineer and data scientist interested in building intelligent systems
-              and data-driven solutions.
-            </p>
-            <p className="text-gray-700 dark:text-gray-300 leading-relaxed">
-              Currently studying at the University of Utah, focusing on machine learning,
-              statistics, and software development.
-            </p>
-          </section>
-
-          {/* Experience */}
-          <section className="mb-10">
-            <h2 className="text-xl font-semibold mb-3 text-black dark:text-white">Experience</h2>
-            <div className="space-y-4">
-              <div>
-                <h3 className="font-medium text-black dark:text-white">Software Engineering Intern, Domo</h3>
-                <p className="text-sm text-gray-600 dark:text-gray-400">
-                  Developed data visualization features and analytics tools
-                </p>
-              </div>
-              <div>
-                <h3 className="font-medium text-black dark:text-white">Teaching Assistant, University of Utah</h3>
-                <p className="text-sm text-gray-600 dark:text-gray-400">
-                  Statistics, data science, and programming courses
-                </p>
-              </div>
-            </div>
-          </section>
-
-          {/* Blog link */}
-          <section>
-            <h2 className="text-xl font-semibold mb-3 text-black dark:text-white">Blog</h2>
-            <Link
-              href="/blog"
-              className="text-gray-700 dark:text-gray-300 hover:text-black dark:hover:text-white underline"
-            >
-              Read my thoughts on software and data science →
-            </Link>
           </section>
         </div>
 
-        {/* Right side - 3D Graph (positioned to align with middle of content) */}
-        <div className="hidden lg:flex items-center h-[600px] relative -mt-20">
+        {/* Right side - 3D Graph (naturally centered) */}
+        <div className="hidden lg:flex items-center justify-center h-[700px]">
           <GraphBlob />
         </div>
       </div>
