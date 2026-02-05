@@ -24,15 +24,25 @@ export function cosineSimilarity(vec1: number[], vec2: number[]): number {
   return dotProduct / (mag1 * mag2);
 }
 
-// Category colors (matching Tailwind aesthetic)
+// Category colors (lighter, pastel tones)
 export const CATEGORY_COLORS = {
-  blog: 0x3b82f6,    // blue-500
-  project: 0x10b981, // green-500
-  skill: 0xa855f7,   // purple-500
+  blog: 0x93c5fd,    // blue-300
+  project: 0x6ee7b7, // green-300
+  skill: 0xd8b4fe,   // purple-300
 } as const;
 
 // Mock embedding nodes with semantic clustering
 export const embeddingNodes: EmbeddingNode[] = [
+  // Central Hub Node
+  {
+    id: 'center',
+    label: 'Portfolio Hub',
+    category: 'skill',
+    position: [0, 0, 0],
+    embedding: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+    color: 0x94a3b8, // slate-400 - neutral gray
+  },
+
   // ML/AI Cluster (upper-right)
   {
     id: 'ml-1',

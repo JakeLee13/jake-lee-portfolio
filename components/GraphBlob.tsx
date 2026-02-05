@@ -22,21 +22,40 @@ export function GraphBlob() {
     )
     camera.position.z = 5
 
-    const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true })
+    const renderer = new THREE.WebGLRenderer({
+      alpha: true,
+      antialias: true,
+      powerPreference: 'high-performance'
+    })
     renderer.setSize(container.clientWidth, container.clientHeight)
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)) // Smooth rendering
     renderer.setClearColor(0x000000, 0)
     container.appendChild(renderer.domElement)
+
+    // Add lighting for 3D effect
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6)
+    scene.add(ambientLight)
+
+    const directionalLight1 = new THREE.DirectionalLight(0xffffff, 0.8)
+    directionalLight1.position.set(5, 5, 5)
+    scene.add(directionalLight1)
+
+    const directionalLight2 = new THREE.DirectionalLight(0xffffff, 0.4)
+    directionalLight2.position.set(-5, -5, -5)
+    scene.add(directionalLight2)
 
     // Create nodes from embeddings data
     const nodes: THREE.Mesh[] = []
     const nodePositions: THREE.Vector3[] = []
 
     embeddingNodes.forEach((embeddingNode) => {
-      const geometry = new THREE.SphereGeometry(0.08, 16, 16)
-      const material = new THREE.MeshBasicMaterial({
+      const geometry = new THREE.SphereGeometry(0.08, 32, 32) // Higher segments for smoother spheres
+      const material = new THREE.MeshStandardMaterial({
         color: embeddingNode.color,
+        metalness: 0.3,
+        roughness: 0.4,
         transparent: true,
-        opacity: 0.7
+        opacity: 0.9
       })
       const node = new THREE.Mesh(geometry, material)
 
@@ -77,34 +96,40 @@ export function GraphBlob() {
       })
     })
 
-    // Animation
+    // Animation with smooth timing
     let frame = 0
-    const animate = () => {
+    let lastTime = 0
+
+    const animate = (currentTime: number) => {
       requestAnimationFrame(animate)
-      frame += 0.005
 
-      // Rotate entire graph slowly
-      scene.rotation.y = frame * 0.2
-      scene.rotation.x = Math.sin(frame * 0.3) * 0.1
+      const deltaTime = currentTime - lastTime
+      lastTime = currentTime
 
-      // Subtle node movement
+      // Smooth frame increment (capped for consistency)
+      frame += Math.min(deltaTime * 0.001, 0.016) // ~60fps max
+
+      // Rotate entire graph slowly and smoothly
+      scene.rotation.y = frame * 0.15
+      scene.rotation.x = Math.sin(frame * 0.25) * 0.08
+
+      // Very subtle node movement for organic feel
       nodes.forEach((node, i) => {
         const originalPos = nodePositions[i]
-        node.position.x = originalPos.x + Math.sin(frame + i) * 0.1
-        node.position.y = originalPos.y + Math.cos(frame + i * 0.7) * 0.1
-        node.position.z = originalPos.z + Math.sin(frame * 0.8 + i) * 0.1
+        node.position.x = originalPos.x + Math.sin(frame + i) * 0.05
+        node.position.y = originalPos.y + Math.cos(frame + i * 0.7) * 0.05
+        node.position.z = originalPos.z + Math.sin(frame * 0.8 + i) * 0.05
       })
 
       // Update edge positions
       edges.forEach((edge) => {
-        const positions = edge.geometry.attributes.position.array as Float32Array
         edge.geometry.attributes.position.needsUpdate = true
       })
 
       renderer.render(scene, camera)
     }
 
-    animate()
+    animate(0)
 
     // Handle resize
     const handleResize = () => {
