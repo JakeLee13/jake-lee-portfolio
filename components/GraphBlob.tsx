@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from 'react'
 import * as THREE from 'three'
+import { embeddingNodes, cosineSimilarity } from '@/lib/embeddings-mock-data'
 
 export function GraphBlob() {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -26,65 +27,54 @@ export function GraphBlob() {
     renderer.setClearColor(0x000000, 0)
     container.appendChild(renderer.domElement)
 
-    // Create nodes (spheres)
-    const nodeCount = 12
+    // Create nodes from embeddings data
     const nodes: THREE.Mesh[] = []
     const nodePositions: THREE.Vector3[] = []
 
-    const nodeMaterial = new THREE.MeshBasicMaterial({
-      color: 0x000000,
-      transparent: true,
-      opacity: 0.6
-    })
-
-    for (let i = 0; i < nodeCount; i++) {
+    embeddingNodes.forEach((embeddingNode) => {
       const geometry = new THREE.SphereGeometry(0.08, 16, 16)
-      const node = new THREE.Mesh(geometry, nodeMaterial)
+      const material = new THREE.MeshBasicMaterial({
+        color: embeddingNode.color,
+        transparent: true,
+        opacity: 0.7
+      })
+      const node = new THREE.Mesh(geometry, material)
 
-      // Position nodes in a rough sphere
-      const theta = Math.random() * Math.PI * 2
-      const phi = Math.random() * Math.PI
-      const radius = 2 + Math.random() * 0.5
-
-      node.position.x = radius * Math.sin(phi) * Math.cos(theta)
-      node.position.y = radius * Math.sin(phi) * Math.sin(theta)
-      node.position.z = radius * Math.cos(phi)
+      // Use pre-defined positions from embeddings data
+      const [x, y, z] = embeddingNode.position
+      node.position.set(x, y, z)
 
       nodePositions.push(node.position.clone())
       nodes.push(node)
       scene.add(node)
-    }
-
-    // Create edges (lines between nodes)
-    const lineMaterial = new THREE.LineBasicMaterial({
-      color: 0x000000,
-      transparent: true,
-      opacity: 0.2
     })
 
+    // Create edges based on cosine similarity
     const edges: THREE.Line[] = []
+    const SIMILARITY_THRESHOLD = 0.5 // Only show connections above this threshold
 
-    // Connect each node to 2-3 nearby nodes
-    nodes.forEach((node, i) => {
-      const distances = nodes.map((otherNode, j) => ({
-        index: j,
-        distance: node.position.distanceTo(otherNode.position)
-      }))
+    // Calculate similarities and create connections
+    embeddingNodes.forEach((node1, i) => {
+      embeddingNodes.forEach((node2, j) => {
+        if (j <= i) return // Avoid duplicate edges and self-connections
 
-      distances.sort((a, b) => a.distance - b.distance)
+        const similarity = cosineSimilarity(node1.embedding, node2.embedding)
 
-      // Connect to 2-3 nearest neighbors (skip self at index 0)
-      const connectionCount = 2 + Math.floor(Math.random() * 2)
-      for (let k = 1; k <= connectionCount && k < distances.length; k++) {
-        const targetIndex = distances[k].index
-        if (targetIndex > i) { // Avoid duplicate edges
-          const points = [node.position, nodes[targetIndex].position]
+        if (similarity >= SIMILARITY_THRESHOLD) {
+          // Create line with opacity based on similarity strength
+          const lineMaterial = new THREE.LineBasicMaterial({
+            color: 0x000000,
+            transparent: true,
+            opacity: (similarity - SIMILARITY_THRESHOLD) * 0.4 // Scale opacity
+          })
+
+          const points = [nodes[i].position, nodes[j].position]
           const geometry = new THREE.BufferGeometry().setFromPoints(points)
           const line = new THREE.Line(geometry, lineMaterial)
           edges.push(line)
           scene.add(line)
         }
-      }
+      })
     })
 
     // Animation
