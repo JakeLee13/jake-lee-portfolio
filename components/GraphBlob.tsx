@@ -18,6 +18,10 @@ export function GraphBlob() {
 
     const container = containerRef.current
 
+    // Detect dark mode
+    const isDarkMode = document.documentElement.classList.contains('dark') ||
+                       window.matchMedia('(prefers-color-scheme: dark)').matches
+
     // Scene setup
     const scene = new THREE.Scene()
     const camera = new THREE.PerspectiveCamera(
@@ -57,7 +61,7 @@ export function GraphBlob() {
     embeddingNodes.forEach((embeddingNode) => {
       const geometry = new THREE.SphereGeometry(0.05, 32, 32) // Smaller, smoother spheres
       const material = new THREE.MeshStandardMaterial({
-        color: 0x000000, // All nodes start as black
+        color: isDarkMode ? 0xffffff : 0x000000, // White in dark mode, black in light mode
         metalness: 0.3,
         roughness: 0.4,
         transparent: true,
@@ -89,7 +93,7 @@ export function GraphBlob() {
         if (similarity >= SIMILARITY_THRESHOLD) {
           // Create line with opacity based on similarity strength
           const lineMaterial = new THREE.LineBasicMaterial({
-            color: 0x000000,
+            color: isDarkMode ? 0xffffff : 0x000000,
             transparent: true,
             opacity: (similarity - SIMILARITY_THRESHOLD) * 0.4 // Scale opacity
           })
@@ -153,11 +157,11 @@ export function GraphBlob() {
       if (nodeRotateTimer > 4000) {
         nodeRotateTimer = 0
 
-        // Reset previous highlighted nodes to black
+        // Reset previous highlighted nodes to default color
         const prevMaterial1 = nodes[currentHighlightIndex1].material as THREE.MeshStandardMaterial
         const prevMaterial2 = nodes[currentHighlightIndex2].material as THREE.MeshStandardMaterial
-        prevMaterial1.color.setHex(0x000000)
-        prevMaterial2.color.setHex(0x000000)
+        prevMaterial1.color.setHex(isDarkMode ? 0xffffff : 0x000000)
+        prevMaterial2.color.setHex(isDarkMode ? 0xffffff : 0x000000)
 
         currentHighlightIndex1 = (currentHighlightIndex1 % (embeddingNodes.length - 1)) + 1
         currentHighlightIndex2 = (currentHighlightIndex1 % (embeddingNodes.length - 1)) + 1
@@ -297,7 +301,7 @@ export function GraphBlob() {
       {/* Hover tooltip */}
       {hoveredNode && (
         <div
-          className="absolute pointer-events-none bg-white/80 backdrop-blur-sm border border-gray-200 rounded-lg px-3 py-2 shadow-lg text-xs font-medium text-gray-900 whitespace-nowrap z-50"
+          className="absolute pointer-events-none bg-white/80 dark:bg-black/80 backdrop-blur-sm border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 shadow-lg text-xs font-medium text-gray-900 dark:text-gray-100 whitespace-nowrap z-50"
           style={{
             left: `${hoveredNode.x}px`,
             top: `${hoveredNode.y - 40}px`,
@@ -309,11 +313,11 @@ export function GraphBlob() {
       )}
 
       {/* Minimal info panel - always visible */}
-      <div className="absolute top-20 left-[22.5rem] bg-white/80 backdrop-blur-sm border border-gray-200 rounded-lg px-3 py-2 shadow-lg max-w-[200px]">
-        <div className="text-xs text-gray-600 leading-relaxed mb-2">
+      <div className="absolute top-20 left-[22.5rem] bg-white/80 dark:bg-black/80 backdrop-blur-sm border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 shadow-lg max-w-[200px]">
+        <div className="text-xs text-gray-600 dark:text-gray-300 leading-relaxed mb-2">
           A personal embedding space showing clusters of my interests:
         </div>
-        <div className="text-[10px] font-medium text-gray-700 space-y-1">
+        <div className="text-[10px] font-medium text-gray-700 dark:text-gray-300 space-y-1">
           <div className="flex items-center gap-1.5">
             <span className="w-2 h-2 bg-red-500 rounded-full"></span>
             <span>{embeddingNodes[highlightedNode1]?.label}</span>
@@ -323,9 +327,9 @@ export function GraphBlob() {
             <span>{embeddingNodes[highlightedNode2]?.label}</span>
           </div>
         </div>
-        <div className="mt-2 pt-2 border-t border-gray-200">
-          <div className="text-[10px] text-gray-500 font-mono">similarity</div>
-          <div className="text-lg font-bold text-gray-900">{similarity.toFixed(3)}</div>
+        <div className="mt-2 pt-2 border-t border-gray-200 dark:border-gray-700">
+          <div className="text-[10px] text-gray-500 dark:text-gray-400 font-mono">similarity</div>
+          <div className="text-lg font-bold text-gray-900 dark:text-gray-100">{similarity.toFixed(3)}</div>
         </div>
       </div>
     </div>

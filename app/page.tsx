@@ -63,7 +63,7 @@ export default function Home() {
         </div>
 
         {/* 3D Graph - below on mobile, right side on desktop */}
-        <div className="flex items-center justify-center lg:justify-center h-[500px] lg:h-[700px] -ml-8 lg:ml-0">
+        <div className="flex items-center justify-center lg:justify-center h-[500px] lg:h-[700px] -ml-16 lg:ml-0">
           <GraphBlob />
         </div>
       </div>
