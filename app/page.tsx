@@ -6,7 +6,7 @@ export default function Home() {
     <div className="min-h-screen flex items-start justify-center px-6 pt-20">
       <div className="w-full max-w-6xl grid lg:grid-cols-2 gap-20 items-start">
         {/* Left side - Content */}
-        <div className="max-w-md justify-self-end pt-12">
+        <div className="max-w-md lg:justify-self-end pt-12">
           {/* Header with name */}
           <header className="mb-8">
             <h1 className="text-3xl font-bold text-black dark:text-white">
@@ -17,7 +17,7 @@ export default function Home() {
           {/* About text without heading */}
           <section className="mb-8">
             <p className="text-gray-700 dark:text-gray-300 leading-relaxed">
-              I&apos;m interested in lots of data things (see right for more). Studied Statistics and Quantitative Analysis at the University of Utah. Currently doing analytics at Domo.
+              Interested in lots of data things. Studied Statistics and Quantitative Analysis at the University of Utah. Based out of Salt Lake City. Currently doing analytics at Domo.
             </p>
           </section>
 
@@ -62,8 +62,8 @@ export default function Home() {
           </section>
         </div>
 
-        {/* Right side - 3D Graph (naturally centered) */}
-        <div className="hidden lg:flex items-center justify-center h-[700px]">
+        {/* 3D Graph - below on mobile, right side on desktop */}
+        <div className="flex items-center justify-center lg:justify-center h-[500px] lg:h-[700px] -ml-8 lg:ml-0">
           <GraphBlob />
         </div>
       </div>
