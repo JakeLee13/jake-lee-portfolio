@@ -17,7 +17,6 @@ import { Scorecard } from "@/components/blog/Scorecard";
 import { SAPortfolioTable } from "@/components/blog/SAPortfolioTable";
 import { VerdictBox } from "@/components/blog/VerdictBox";
 import { ComputeIndexTracker } from "@/components/blog/ComputeIndexTracker";
-import { ComputeIndexPerformance } from "@/components/blog/ComputeIndexPerformance";
 import { EUVSupplyChain } from "@/components/blog/EUVSupplyChain";
 import { TransistorEvolution } from "@/components/blog/TransistorEvolution";
 import { HBMStackDiagram } from "@/components/blog/HBMStackDiagram";
@@ -46,7 +45,6 @@ const mdxComponents = {
   SAPortfolioTable,
   VerdictBox,
   ComputeIndexTracker,
-  ComputeIndexPerformance,
   EUVSupplyChain,
   TransistorEvolution,
   HBMStackDiagram,
