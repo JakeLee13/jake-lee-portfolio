@@ -1,0 +1,195 @@
+---
+title: "Simple Surface, Deep Engine: How Context Engineering Drives Rep Productivity"
+date: "2025-03-20"
+description: "How I built a 6-layer AI pipeline that compresses CRM data, call transcripts, and emails into prioritized, actionable intelligence — so a sales rep can go from notification to drafted email in 90 seconds."
+---
+
+A rep opens RevRadar at 8:30 AM. Three deals are flagged "Right Now." The first says "Respond — unanswered inbound from VP of Engineering, 2 days ago." They click "Take Action." A drawer opens. The AI has already drafted a follow-up email referencing the VP's concern about Q3 timelines from a Gong call two weeks ago. The rep reviews it, tweaks one line, and sends it. Elapsed time: 90 seconds.
+
+That 90 seconds replaced what used to be a 30-minute ritual: open Salesforce, check last activity, open Gong, scrub through the recording, open Gmail, draft something from memory. Multiply that across 40 deals and you start to see why reps plateau — not because they can't sell, but because their tools make them archaeologists instead of sellers.
+
+The surface is simple. The time-to-action is near zero. But that simplicity is the output of a 6-layer AI pipeline that compresses raw CRM data, call transcripts, and email threads into exactly the right context at exactly the right moment. **The hard part isn't the UI — it's the context engineering that makes the UI possible.**
+
+This post is the story of that pipeline.
+
+---
+
+## What the rep sees
+
+The interface is deliberately minimal. A rep's morning starts with the Focus View: their top 10 deals, bucketed into three urgency tiers.
+
+- **Right Now** — meeting today, unanswered inbound, or critical priority
+- **This Week** — meetings within 5 days, high-scoring deals
+- **Look Ahead** — deals worth tracking, no fire
+
+Each card shows one action type, one context line, one top risk, one top action, and two buttons: "Done" and "Take Action." That's it.
+
+{/* Screenshot: Focus View */}
+
+"Take Action" is where the magic happens. One click opens the deal drawer, and the AI has already fired a contextual prompt — a drafted email, a call prep agenda, a coaching assessment, or a pricing proposal — grounded in the deal's full history. The rep doesn't see layers, scores, embeddings, or pipelines. They see *what to do next*.
+
+{/* Screenshot: Deal Chat with auto-fired response */}
+
+The question is: how does the system know what to surface, what action to suggest, and what context to assemble — all before the rep even clicks?
+
+---
+
+## The 6-layer pipeline
+
+Everything the rep sees is the output of six processing layers that run on different schedules, each compressing and enriching the data for the next.
+
+<LayerPipeline />
+
+Each layer has a clearly defined job. The raw data gets progressively compressed — from thousands of emails and hours of call recordings down to a single prioritized action card with 2KB of curated context. Let me walk through each layer.
+
+---
+
+## Layers 0–1: Teaching an LLM to extract evidence, not summaries
+
+### Context cards: giving the LLM the full picture
+
+Before any signal extraction happens, Layer 0 compresses 50+ Salesforce fields per opportunity into rich markdown "context cards." These cards include stage progression history, close date changes, financial details, account info, competitor mentions, and data source references. The card is the deal's biography — everything the LLM needs to triangulate what it hears in calls and emails against what the CRM says.
+
+Layer 0 also scrapes company websites and generates 1-3 sentence summaries ("what does this company do?"), so the LLM understands the prospect's business context without burning tokens on raw HTML.
+
+### Signal extraction: complete quotes, not summaries
+
+Layer 1 runs two parallel streams every morning at 8:15 AM — one for Gong call transcripts, one for email threads — each powered by an LLM with the opportunity's context card injected.
+
+The critical design decision: the prompt enforces **complete verbatim quotes** in every extracted signal. Not summaries. Not paraphrases. The actual words spoken by the actual person, with their name and role attached.
+
+```json
+{
+  "event_date": "2024-04-22",
+  "source_context": "Q3 Planning Review Call",
+  "actors": ["Sarah Kim (VP Engineering)"],
+  "description": "Sarah stated: 'We've decided to hold off on new vendor commitments until the Q3 budget review is complete.' This indicates a timeline risk tied to internal budget cycles.",
+  "signal_category": "Risk: Timeline/Stall"
+}
+```
+
+Why does this matter? Because reps don't trust AI summaries. When a system tells them "there's a timeline risk on this deal," their first question is "says who?" If the answer is a verbatim quote from the VP of Engineering on a specific call, they act on it. If the answer is a vague AI summary, they ignore it. The evidence *is* the product.
+
+The extraction targets six CRO-mandated milestones (Demo → POC → Pricing → Ask for Sale → Verbal Agreement → Closing Plan), five risk categories (Competitor, Budget, Authority, Timeline/Stall, Product Gap), plus use cases and momentum signals. Each call or email thread yields 3-8 structured signals, capped to avoid noise.
+
+Both streams process incrementally — only analyzing calls and emails that haven't been processed yet. A morning run that processes 200 new calls across the pipeline takes minutes, not hours, thanks to parallel LLM processing with 10-15 workers.
+
+---
+
+## Layers 1.5–2: From signals to intelligence
+
+### The 5-lane timeline
+
+Layer 1.5 runs 15 minutes after signal extraction, rebuilding a 5-lane timeline for every active deal:
+
+<TimelineLanes />
+
+Each lane captures a different dimension of deal activity. The Stage lane tracks CRM stage transitions. The Milestone lane preserves verified milestones from the weekly L2 synthesis (not rebuilt daily, to prevent noisy re-scoring). The Signal, Risk, and Activity lanes pull from L1 outputs and raw interaction timestamps.
+
+Rep overrides are injected as synthetic signals — when a rep corrects an AI-predicted milestone date, the override is tagged "REP OVERRIDE" and always wins in downstream processing.
+
+{/* Screenshot: Deal Pulse Chart */}
+
+### Weekly synthesis: milestone consensus, risk severity, action generation
+
+Layer 2 runs weekly on Monday mornings. It takes all L1 signals and synthesizes them into five outputs per deal:
+
+**Milestone consolidation** — When multiple calls mention a demo happening, L2 uses date-proximity logic (signals within 7 days = same event) and LLM reconciliation for conflicts. The output: six verified milestone dates with confidence levels.
+
+**Risk synthesis** — Each L1 risk signal becomes a structured risk record with severity (Critical, High, Medium), evidence, and suggested mitigation.
+
+**Action generation** — For each risk or opportunity gap, the LLM generates a specific action: who should do what, by when, and why it matters for deal trajectory. "Schedule CFO meeting by Mar 10 to secure budget approval — currently blocking verbal agreement."
+
+**Executive summary** — A narrative per deal with origin story, key milestones, current blockers, and next critical action. Written for reps, not executives — direct, evidence-backed, no fluff.
+
+**Timeline events** — Milestones are frozen in the timeline at this point, creating the stable Milestone lane that the daily L1.5 rebuild preserves.
+
+The key principle: L1 extracts, L2 synthesizes. Each prompt does one thing well. When your extraction and synthesis are in the same prompt, you get neither done well.
+
+---
+
+## Layer 3: The case for deterministic scoring
+
+Here's the counterintuitive part. After two layers of sophisticated LLM analysis, the scoring layer uses **zero LLM calls**. It's pure deterministic math.
+
+Why? Because LLMs are terrible calibrators. When L2 assigns risk severity, approximately 87% of deals end up rated "Critical." The model errs on the side of flagging everything — which means severity is useless for prioritization. If everything is critical, nothing is.
+
+The solution: decouple scoring from the LLM entirely. Layer 3 uses objective CRM signals that actually vary across deals.
+
+<ScoringBreakdown />
+
+The scoring is a weighted linear combination. Close date proximity dominates (a deal closing in 10 days needs attention regardless of AI analysis), followed by stage, signal recency, and risk type tags. The daily override signals — meeting today (+25) and unanswered inbound within 14 days (+20) — are the most important for rep experience. They surface the right deal *today*, not just this week.
+
+Two tiers: "This Week" (score ≥ 65) and "On Radar" (score < 65). No hard filters — all Stage 2-5 deals pass through to the output. The frontend decides visibility.
+
+The `is_dead_deal` flag (stage age ≥ 180 days or close date > 1 year overdue) is informational, not a filter. It helps reps clean up their pipeline without the system silently hiding deals.
+
+This layer runs hourly. New CRM updates, new meeting bookings, new inbound emails — all immediately reflected in the scoring. The rep's Focus View is always current.
+
+---
+
+## Layer 4 + Deal Chat: Vector search meets action routing
+
+### Semantic search for conversational RAG
+
+Layer 4 embeds every timeline event into a vector index using Cohere's multilingual embedding model, stored in Domo's Recall vector database.
+
+<RagPipeline />
+
+The single index (`revradar-all`) uses metadata properties for scoping. When a rep asks "What was the CFO's concern about pricing?", the query hits the vector DB filtered to that specific opportunity. When a manager asks "Which deals have competitor mentions?", the same index serves a broader query filtered to their team. One index, multiple scopes.
+
+Each event is compressed to max 1,800 characters and includes metadata for filtering: opportunity ID, account name, forecast owner, manager, event date, lane, source type, signal category, and actors.
+
+### The action routing flow
+
+This is where the 6 layers converge into rep behavior.
+
+<ActionRoutingFlow />
+
+1. **L3 scores the deal** and places it in the Focus View with a priority tier and daily flags.
+2. **Signal determines action type.** Meeting today → call-prep. Unanswered inbound → respond. Competitor risk → competitive defense. No signal match → milestone progression.
+3. **Rep clicks "Take Action."** The deal drawer opens. A contextual prompt auto-fires in the Deal Chat panel.
+4. **Context is assembled** from six sources: L0 context cards, L2 executive summary, milestones, risks, actions, and the 30 most recent timeline events.
+5. **The LLM generates a response** — an email draft, call agenda, coaching assessment, or pricing proposal — grounded in the assembled context.
+
+The Deal Chat also supports tool calling. `searchInteractions` queries the vector index for semantically relevant timeline events. `calculateDealEconomics` runs a pricing model based on the prospect's use case. `buildDemoApp` generates a custom demo personalized to the prospect's industry and pain points.
+
+Five quick actions cover 90% of rep needs: prep for a call, write the next email, coach me on this deal, build their pricing proposal, build their demo. Each one is a pre-built prompt that forces the right tool and assembles the right context.
+
+The result: zero-click-to-action. From "you have an unanswered email" to "here's a drafted response referencing last week's call" — one click, 90 seconds.
+
+---
+
+## Context engineering > prompt engineering
+
+Here's the thesis behind all of this.
+
+<ContextFunnel />
+
+By the time a prompt fires in Deal Chat, 95% of the work is already done. The context has been extracted, synthesized, scored, indexed, and assembled. The prompt itself is straightforward — "draft a follow-up email based on this deal context." The magic isn't in the prompt. It's in the context that reaches the prompt.
+
+This is why "just put GPT on your CRM" doesn't work. Without the compression layers, the LLM's context window is full of noise — raw Salesforce fields, unprocessed email chains, hour-long call transcripts. The model drowns in irrelevant data and produces generic, ungrounded responses that reps ignore.
+
+With the compression layers, every token in the context window is high-signal: verified quotes from specific people, synthesized risks with evidence, prioritized actions with rationale, milestone dates with confidence levels. The LLM doesn't need to be clever — it needs to be presented with the right information.
+
+**The rep productivity gain comes from context density, not model capability.**
+
+A flashy UI on top of bad context is just a fast way to get wrong answers. A simple UI on top of deeply compressed, evidence-backed context is how you build tools that reps actually trust and use every morning.
+
+---
+
+## What I'd build next
+
+**Real-time signal extraction.** L1 currently runs daily at 8:15 AM. Streaming analysis of calls and emails as they happen would surface signals within minutes, not hours.
+
+**Learned scoring weights.** L3 weights are hand-tuned. Tracking which deals reps actually act on (vs. ignore) could train weights empirically from behavior data.
+
+**Cross-deal pattern detection.** Which risk clusters predict loss? Which action types correlate with deals advancing? The data is there — the aggregation isn't.
+
+**Rep feedback loop.** When reps override milestone dates, that's labeled training data. Using override patterns to fine-tune L1 extraction would close the loop between rep judgment and AI signal quality.
+
+---
+
+The hard part of building AI for sales isn't the model or the UI. It's the 6 layers of context engineering between them — compressing thousands of signals into the right 2KB of context, at the right time, for the right person. RevRadar is what happens when you invest in the pipeline instead of the prompt: a rep opens their laptop at 8:30 AM and knows exactly what to do, with the evidence to do it well.
+
+*Built on Domo's infrastructure using Jupyter notebooks for the data pipeline and React/Redux/D3 for the app. The architecture patterns described here are from the production system, with deal data replaced by fictional examples.*

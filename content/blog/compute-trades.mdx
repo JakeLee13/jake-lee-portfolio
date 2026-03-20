@@ -1,0 +1,519 @@
+---
+title: "Compute Trades"
+date: "2026-03-19"
+description: "I typed a request into Claude Code. What actually happened? A deep dive from token generation to EUV lithography — tracing every layer of the AI compute supply chain."
+---
+
+I typed this into Claude Code ten minutes ago:
+
+> "Add dark mode to the blog."
+
+A few minutes later, seven files were edited, tests passed, and dark mode worked. From keystroke to commit, maybe 4 minutes of wall-clock time.
+
+But what actually happened in those 4 minutes? Where did my request go? What hardware processed it? What physical infrastructure made it possible? And why is all of that infrastructure about to run out?
+
+This post traces a single inference request through every layer of the AI compute supply chain — from the software that tokenizes my words, to the GPU that generates the response, to the memory that holds the model's state, to the foundry that manufactured the chip, to the $380 million machine that printed the circuits. Each layer has a story. Each layer has a bottleneck. And each bottleneck has an investment thesis.
+
+Not financial advice. Just first-principles analysis from someone obsessed with where the constraints are.
+
+---
+
+## What actually happened
+
+Here's the step-by-step path of my request, from keystroke to response:
+
+<InferenceFlow />
+
+Let me walk through the parts that matter most.
+
+### Tokenization
+
+When I typed "add dark mode to the blog," Claude Code didn't send those words directly. It packaged my entire conversation — system prompt, tool schemas, previous messages, file contents from earlier reads — into a single API request. That request might contain 50,000+ tokens of context.
+
+The text gets split into subword tokens using Byte Pair Encoding (BPE). Common sequences get their own token ("ing", "tion", " the"). Rare words get broken into pieces. Roughly 4 characters per token, or ~150 tokens per 100 words. The tokenizer is deterministic — the same input always produces the same tokens.
+
+### Prefill and the KV cache
+
+Here's where the GPU work begins. During the "prefill" phase, the model processes all input tokens in parallel — computing attention across the full context. This produces Key and Value matrices for every token at every layer of the transformer.
+
+These KV matrices get cached in the GPU's HBM (High Bandwidth Memory). For a 200K-token context window on a large model, the KV cache alone can consume 10–50 GB of HBM. This is why memory bandwidth matters so much for inference — the model isn't doing heavy arithmetic. It's reading and writing massive amounts of cached state.
+
+Every subsequent output token only needs to compute attention against the *cached* keys and values from all previous tokens, rather than reprocessing the entire input. This turns what would be O(n²) computation into O(n) per token — the KV cache is the single most important optimization for fast inference.
+
+### Mixture of Experts
+
+If the model uses a Mixture of Experts architecture (as many frontier models do), not every parameter activates for every token. A learned router network examines each token and selects which "expert" subnetworks should process it — typically 2 out of 8 or 16 experts.
+
+This means a model with 300B+ total parameters might only activate ~75B per forward pass. You get the quality of a massive model with the speed of a much smaller one. But it creates an engineering challenge: the *entire* model still needs to fit in memory (all experts must be loadable), even though only a fraction runs per token. This is another reason HBM capacity matters.
+
+### The agentic loop
+
+This is what makes Claude Code different from ChatGPT.
+
+After the model generates a response, it might include a structured tool call: `Read("app/globals.css")`. At this point, generation pauses. Claude Code executes the tool *locally on my machine* — reading the file from my filesystem. The file contents get appended to the conversation context. Then inference resumes on the remote GPU cluster with the new context.
+
+For my "add dark mode" request, this loop repeated maybe 15–20 times: read files, search for patterns, edit files, read the results, run tests, report back. Each iteration is a full round-trip — local tool execution, then another inference call to the GPU cluster. The model maintains coherent reasoning across all of these turns because the full conversation context (including tool results) is sent with each request.
+
+### The physical path
+
+My request traveled: MacBook → home WiFi → ISP → internet backbone → load balancer → API gateway → GPU cluster → specific GPU → back through the chain. Network round-trip: ~50–200ms. The inference itself — prefill plus hundreds of decode steps — takes seconds. Streaming means I see tokens arrive in real-time rather than waiting for the full response.
+
+The GPU cluster that processed my request is probably running on CoreWeave, GCP, or AWS infrastructure. Thousands of GPUs in liquid-cooled racks, connected by InfiniBand networking, drawing tens of megawatts of power. My single request used a fraction of one GPU for a few seconds. But multiply that by millions of concurrent users, and you start to see why the supply chain matters.
+
+---
+
+## Not everyone uses it this way
+
+My Claude Code workflow is one of four fundamentally different ways organizations consume LLM inference. Each creates demand for the same scarce GPU hours — but the infrastructure between the user and the GPU looks radically different.
+
+<ConsumptionModes />
+
+**Direct consumer products** — Claude.ai, ChatGPT — are the simplest path. You type, the model responds. The request goes over the public internet to the provider's GPU cluster and back. No tools, no orchestration, just chat.
+
+**Agentic developer tools** — Claude Code, Codex — add the tool-use loop I described above. The LLM inference still happens in the cloud, but the tools execute locally. The model orchestrates your development environment remotely while reasoning on GPU hardware that might be 2,000 miles away.
+
+**Enterprise backend APIs** — AWS Bedrock, Google Vertex — are how products like Stripe or Ramp embed AI behind their features. The request never hits the public internet. It flows through a VPC (Virtual Private Cloud) from the application server to the inference endpoint, all within AWS or GCP infrastructure. The end customer using Stripe's fraud detection or Ramp's expense categorization has no idea an LLM is involved.
+
+**Internal productivity agents** are the most interesting category. Ramp built an agent called Inspect that writes ~30% of their merged pull requests. Engineers @mention it in Slack. It spins up a full sandboxed development environment on Modal — pre-cached with 30-minute filesystem snapshots so dependencies are always fresh. The agent clones the repo, writes code, runs tests, and pushes a PR. Same underlying LLM inference as me chatting with Claude.ai, but wrapped in a full CI/CD pipeline with database access, feature flags, and monitoring.
+
+The investment insight: **all four modes create demand for the same scarce physical resources** — GPU hours, HBM bandwidth, optical networking, fab capacity, EUV tools. The consumption surface area is expanding in every direction simultaneously. Consumer chat was just the beginning.
+
+---
+
+## The thesis
+
+This boils down to one thing: **margin flows to whoever controls the tightest bottleneck.** And that bottleneck is shifting — from power (2024–25) to logic and memory (2026–27) to EUV lithography (2028+). The goal isn't to chase where the constraint is today. It's to be positioned where it's *moving to*.
+
+Here are the numbers that matter right now:
+
+<ComputeInsightCards />
+
+These aren't speculative projections. Hyperscaler capex is committed capital. TSMC's capacity shortfall is from their own chairman. H100 spot prices are real deals being signed. And ASML's production ceiling is physics.
+
+### The bottleneck keeps moving
+
+<BottleneckTimeline />
+
+Each layer of the AI supply chain has a different lead time. Data centers: 8–12 months. Power: 1–2 years. Fabs: 2–3 years. EUV tools: 3–5 years. As the shorter-lead-time problems get solved — and power and data centers *are* being built rapidly — the constraint cascades down to whatever takes longest to scale.
+
+Per Dylan Patel at SemiAnalysis: there's no more capacity to slide from mobile and PC to AI. Nvidia is already the largest customer at both TSMC and SK Hynix. The consumer-to-AI shift is fully tapped out. From here, scaling means building *new* fab capacity, and that's gated by ASML's ability to produce EUV tools.
+
+---
+
+# Following the hardware down
+
+We've traced the software path — from token to tool call and back. Now let's trace the physical path. What is the GPU cluster that processed my request? What does it look like? How does data move through it? And what had to be manufactured, packaged, and shipped to make it exist?
+
+Each section goes one layer deeper into the supply chain.
+
+---
+
+## The data center — racks, optics, and the neocloud model
+
+### What an AI data center actually looks like
+
+A modern AI training cluster is one of the most power-dense, thermally challenging, and networking-intensive structures humans build. Understanding the physical reality helps explain why companies like CoreWeave can build billion-dollar businesses and why optical networking stocks matter.
+
+**Power density.** A traditional enterprise data center rack draws 5–10 kW. An AI GPU rack draws 40–100+ kW. An Nvidia DGX GB200 NVL72 cabinet (72 Blackwell GPUs in a single liquid-cooled rack) draws ~120 kW. This 10–20x increase in power density changes everything about data center design.
+
+**Cooling.** Air cooling, which worked fine for decades of enterprise computing, fails above ~30 kW per rack. The heat simply can't be removed fast enough through air circulation. AI data centers require direct liquid cooling (DLC) — cold plates bolted directly to GPUs and CPUs, with liquid loops carrying heat to building-level heat exchangers. Some facilities use immersion cooling, submerging entire servers in dielectric fluid. Nvidia's Blackwell systems require liquid cooling by design — there's no air-cooled option.
+
+**Scale.** A single large training cluster might contain 16,000–100,000+ GPUs. Meta's next-generation training cluster reportedly targets 600,000+ GPUs. At 700W per GPU (Blackwell), a 100K GPU cluster draws 70 MW just from the GPUs — before networking, storage, cooling overhead, and power conversion losses. Total facility power for such a cluster approaches 100–150 MW.
+
+<DataCenterDiagram />
+
+### The networking hierarchy
+
+In a large AI cluster, the network is as important as the GPUs. Training large models requires constant communication between GPUs — exchanging gradients during training, synchronizing activations during pipeline-parallel inference. If the network can't keep up, GPUs sit idle waiting for data.
+
+**GPU-to-GPU (intra-node): NVLink.** Within a single server or cabinet, Nvidia's NVLink connects GPUs at 1.8 TB/s (NVLink 5.0, Blackwell). NVSwitch chips act as crossbar switches connecting all GPUs within a node. This is the fastest link in the hierarchy and uses on-board copper traces — short distances, massive bandwidth.
+
+**Node-to-node (intra-cluster): InfiniBand.** Between servers in a cluster, InfiniBand provides 400–800 Gbps per port using copper direct-attach cables (DAC) for short distances (1–5m) or active optical cables for longer runs. Nvidia acquired Mellanox in 2020 for $7B specifically for InfiniBand — they understood that owning the network was as important as owning the GPU.
+
+**Rack-to-rack and beyond: Optical networking.** As distance increases beyond ~5 meters, copper can't maintain the signal. Active optical cables use laser transmitters (typically VCSEL-based for short-reach, or edge-emitting lasers for longer distances) to convert electrical signals to light, send them through fiber, and convert back. A spine switch connecting racks might handle 51.2 Tbps aggregate bandwidth.
+
+**Between clusters and data centers: Coherent optics.** For distances beyond ~100 meters — connecting buildings within a campus, or data centers across a metro area — coherent optical transceivers become necessary. These devices use sophisticated digital signal processing (DSP) and advanced modulation formats (like DP-16QAM) to squeeze 400–800 Gbps through a single fiber pair. For intercontinental links, Dense Wavelength Division Multiplexing (DWDM) stacks dozens of wavelengths onto a single fiber, achieving terabits of aggregate bandwidth.
+
+**Why optical networking is a bottleneck.** Every GPU added to a cluster requires proportionally more networking. But the relationship isn't linear — it's superlinear. A cluster of N GPUs doing all-reduce communication generates O(N) network traffic. But the number of potential point-to-point paths scales O(N²). Network architects use clever topologies (fat-tree, dragonfly, rail-optimized) to manage this, but the fundamental scaling challenge means optical networking demand grows faster than GPU demand.
+
+This is why Coherent Corp and Lumentum matter. They make the optical transceivers, laser sources, and photonic components that enable data movement at scale. Situational Awareness LP holds Lumentum as their 4th-largest position ($479M) and Coherent as their 11th ($89M). The signal is clear: as clusters scale from thousands to hundreds of thousands of GPUs, optical networking becomes a binding constraint.
+
+### The neocloud business model
+
+A "neocloud" is a cloud provider built specifically for GPU workloads — CoreWeave, Lambda Labs, Together AI, and others. The business model is straightforward: acquire GPUs (often before they're available on the open market through early Nvidia relationships), build optimized GPU data centers, and rent compute to AI companies at premium prices.
+
+**Why it works right now:** H100 deals are signing at $2.40/hr for 2–3 year contracts. The total cost of ownership to build and operate a Hopper cluster is about $1.40/hr across a five-year life. That's 70%+ gross margin. In a supply-constrained market where labs will pay almost anything for compute, the neocloud model prints money.
+
+**CoreWeave** went from a crypto mining operation to a $35B+ valuation AI cloud provider in under three years. They IPO'd in March 2025 and have raised billions in debt financing secured by GPU clusters. Their key advantage is operational speed — they can deploy GPU capacity months faster than hyperscalers building from scratch.
+
+**Oracle** is the surprising hyperscaler play. Zuckerberg's deal to use Oracle's cloud for Meta's AI training, combined with Oracle's role as a backend provider for OpenAI, positions them as a major GPU cloud player. Oracle's advantage is their willingness to deploy massive GPU clusters quickly with flexible terms — something AWS, Azure, and GCP are slower to do due to their enormous existing businesses.
+
+### GPUs that appreciate in value
+
+This is the most counterintuitive part of the whole thesis, from Patel's analysis.
+
+The conventional bear case says GPUs depreciate as better chips arrive. But in a supply-constrained world, the price isn't set by what else you could buy — it's set by **the value you can extract from it today**.
+
+GPT-5.4 runs cheaper per token and produces better output than GPT-4 on the *same hardware*. The TAM for GPT-4 tokens was maybe tens of billions. For GPT-5.4 tokens, it's north of $100B. Same H100, more valuable output. So the GPU is worth more.
+
+### The Alchian-Allen effect
+
+A fun economics concept that applies here. If GPUs get more expensive via a fixed-cost increase, the *ratio* between using the best model versus a mediocre one narrows. If an H100 goes from $2 to $3/hr but Opus produces 1M tokens and Sonnet produces 2M, the effective premium for frontier quality shrinks from 2x to 1.5x. Everyone shifts to the best model.
+
+The compute crunch creates a flywheel. Best model → most revenue → can pay highest prices for scarce compute → locks in more capacity → maintains best model. This is why "all the volumes are on the best models today."
+
+---
+
+## The GPU — from triangles to tensors
+
+My request was processed by specific hardware — likely an H100 or Blackwell GPU inside one of those liquid-cooled racks. But how did a chip designed to render video game graphics become the engine of the AI revolution?
+
+### From pixel pushers to tensor engines
+
+**The GPU concept (1990s).** Early 3D graphics cards (Voodoo, TNT, GeForce) were fixed-function pipelines — hardwired circuits that could only do one thing: transform 3D triangles into 2D pixels. Each generation added more fixed-function units (texture mapping, anti-aliasing, pixel shading). The chips were fast at graphics but useless for anything else.
+
+**Programmable shaders (early 2000s).** The shift to programmable shader processors (starting with DirectX 8/9 era GPUs) was the critical inflection. Instead of fixed circuits, GPUs gained small programmable cores that could execute custom programs on each vertex and pixel. This made GPUs flexible — and researchers noticed that if you could program them, maybe you could use them for non-graphics computation.
+
+**GPGPU and CUDA (2006–2007).** Before CUDA, using a GPU for general computation meant disguising your math problem as a graphics operation — encoding data as "textures" and computation as "shader programs." It was an ugly hack. Nvidia's CUDA (Compute Unified Device Architecture), launched with the Tesla architecture in 2006, changed everything. CUDA exposed the GPU's parallel processors through a C-like programming language. For the first time, you could write normal-looking code and run it on thousands of GPU cores simultaneously.
+
+This was not inevitable. ATI (later AMD) had comparable hardware but bet on open standards (OpenCL) rather than building a proprietary ecosystem. The difference in execution was massive — CUDA had better tools, better documentation, better libraries, and critically, **better academic adoption**. By the time deep learning exploded in 2012, the CUDA ecosystem was already 6 years deep.
+
+### The AlexNet moment
+
+In September 2012, Alex Krizhevsky, Ilya Sutskever, and Geoffrey Hinton entered the ImageNet Large Scale Visual Recognition Challenge with a deep convolutional neural network trained on two Nvidia GTX 580 GPUs. AlexNet achieved a top-5 error rate of 15.3% — crushing the second-place entry (26.2%) which used hand-crafted features.
+
+This wasn't just an incremental improvement. It was a paradigm shift. The entire field of computer vision pivoted to deep learning overnight. And every researcher who wanted to replicate the result needed Nvidia GPUs and CUDA.
+
+### The architecture generations
+
+<GPUEvolution />
+
+**Volta (2017) was the inflection point.** The V100 introduced Tensor Cores — specialized matrix multiplication units that could do mixed-precision (FP16 × FP16 → FP32) matrix operations at roughly 5× the speed of standard CUDA cores. This was Nvidia explicitly designing hardware for deep learning. The V100 became *the* AI training GPU, and its tensor core design philosophy carries through every subsequent generation.
+
+**Ampere (2020)** added third-generation tensor cores with support for bfloat16, TF32, and structured sparsity (a 2:4 pattern that doubles effective throughput for compatible workloads). MIG (Multi-Instance GPU) allowed partitioning a single A100 into up to seven independent instances — crucial for inference serving where not every job needs a full GPU. The A100 dominated AI training for three years.
+
+**Hopper (2022)** brought the Transformer Engine — hardware that automatically manages FP8 precision during training. FP8 uses 8 bits instead of 16, halving memory usage and doubling throughput for transformer models with minimal accuracy loss. The engine dynamically scales between FP8 and FP16 within each layer based on the statistics of the activations. NVLink 4.0 hit 900 GB/s bidirectional between GPUs. The H100 became "the AI currency" — the unit of account for compute deals.
+
+**Blackwell (2024)** is a two-die design: two GPU dies connected by a 10 TB/s chip-to-chip link on a single module. Second-generation Transformer Engine with FP4 support. NVLink 5.0 at 1.8 TB/s. HBM3E memory. The B200 roughly doubles the training throughput of H100 for large language models and achieves up to 4x improvement in inference throughput (where lower precision matters more).
+
+**Rubin (2026)** will use HBM4 (with the doubled 2048-bit interface), next-generation NVLink, and a new architecture. Jensen Huang has committed to an annual cadence — a new GPU architecture every year, alternating between new designs and optimized refreshes. This is unprecedented in the semiconductor industry, where design cycles traditionally took 2–3 years.
+
+### The CUDA moat
+
+CUDA is more than a programming language. It's an ecosystem:
+
+- **cuBLAS, cuDNN, cuFFT, cuSPARSE** — optimized libraries for every common operation in deep learning
+- **NCCL** — multi-GPU communication library, critical for distributed training
+- **TensorRT** — inference optimization framework
+- **Triton** (Nvidia's, distinct from OpenAI's Triton) — kernel programming framework
+- **CUDA toolkit** — debuggers, profilers, compilers, 20 years of accumulated tooling
+- **Academic papers** — the vast majority of ML research is written, tested, and benchmarked on CUDA
+
+AMD's ROCm, Intel's oneAPI, and OpenAI's Triton have all tried to provide alternatives. ROCm has improved significantly — AMD's MI300X is competitive on paper. But "competitive on paper" versus "works at scale in production with minimal engineering effort" is a gap measured in years and billions of dollars of ecosystem investment. Every major ML framework (PyTorch, JAX, TensorFlow) works best on CUDA because that's what the developers use, which means that's what gets optimized, which means that's what developers continue to use. Classic lock-in flywheel.
+
+### Custom silicon: the alternatives
+
+Not everyone is content depending on Nvidia:
+
+**Google TPU** has the longest lineage. TPU v1 (2016) was inference-only, designed for the specific matrix operations in Google's production models. TPU v2 (2017) added training capability. By TPU v6 (Trillium, 2024), Google has competitive training hardware — but only for internal use and Google Cloud customers.
+
+**AWS Trainium/Inferentia** targets the same vertical integration play. Trainium 2 (2024) is designed for large-scale training clusters. Amazon's advantage is packaging Trainium into SageMaker so developers never have to think about the hardware.
+
+**Broadcom's custom ASIC business** quietly designs custom AI accelerators for hyperscalers (reportedly Google, Meta, and others). Their revenue from AI-related custom silicon has been growing rapidly. This is the "behind-the-scenes" player that doesn't get headlines but captures significant value.
+
+The investment lens: Nvidia at 14% allocation reflects the belief that the CUDA moat holds for the foreseeable future, but isn't unassailable. Broadcom at 7% is a hedge — if custom silicon gains share, Broadcom benefits. The key question is whether CUDA's ecosystem advantage is permanent (like Windows in the 1990s) or temporary (like Blackberry before the iPhone). Most evidence points toward durable dominance for at least this investment horizon.
+
+---
+
+## The memory — where my KV cache lives
+
+Remember the KV cache from the inference walkthrough? Those tens of gigabytes of cached attention state live in HBM — High Bandwidth Memory — soldered right next to the GPU die. This is the layer that's quietly becoming just as binding as the GPU itself.
+
+### Why memory is the hidden bottleneck
+
+A modern AI accelerator does one thing overwhelmingly: **move data**. The arithmetic is fast — a Blackwell GPU can do 20 petaFLOPS of FP4 computation. But those compute units sit idle unless memory can feed them fast enough. The ratio of compute to memory bandwidth is the key metric, and it's been worsening for years. This is the "memory wall" — and it's why HBM has become the most fought-over component in the AI supply chain.
+
+### DRAM fundamentals
+
+All DRAM works the same way at the basic level: a tiny capacitor stores a charge (1 or 0), and a transistor controls access to that capacitor. The capacitor leaks charge constantly, so every cell must be refreshed thousands of times per second. A single DRAM chip contains billions of these capacitor-transistor pairs arranged in a grid of rows and columns.
+
+Standard DRAM connects to the processor through a relatively narrow bus — DDR5 uses a 64-bit interface per channel. You can add more channels, but each one needs its own set of pins on the package, and pins are physically large and expensive. There's a fundamental limit to how many pins you can fit.
+
+### The invention of HBM
+
+HBM was born from a collaboration between AMD and SK Hynix, starting around 2008–2010. AMD's Mike O'Brien and Bryan Black had a problem: their GPUs needed more memory bandwidth than conventional GDDR could provide, and they couldn't add more pins to the package.
+
+The solution was radical: **stack DRAM dies on top of each other and connect them vertically.** Instead of a 64-bit bus going horizontally across a circuit board, HBM uses a 1024-bit bus going vertically through the stack using Through-Silicon Vias (TSVs) — tiny copper-filled holes drilled through each silicon die.
+
+TSVs are made by etching holes ~5–10μm in diameter through the silicon, lining them with insulation, and filling them with copper. Each HBM stack has tens of thousands of TSVs creating simultaneous vertical connections. On top of the TSVs, micro-bumps (~40μm solder balls) connect adjacent dies. The bottom die in each stack is a "logic die" that interfaces with the GPU through the shared silicon interposer.
+
+JEDEC standardized HBM in 2013. SK Hynix produced the first HBM1 chips in 2015, and AMD's Fiji GPU was the first to use them. But it was Nvidia's adoption of HBM2 in the Tesla P100 (Pascal, 2016) that established HBM as the standard for AI accelerators.
+
+<HBMStackDiagram />
+
+### The generation leap
+
+Each HBM generation stacks more dies, wider interfaces, and exponentially more bandwidth:
+
+- **HBM1 (2015):** 4-high stack, 128 GB/s. The proof of concept.
+- **HBM2 (2016):** 8-high, 256 GB/s. Used in Nvidia V100.
+- **HBM2E (2020):** 8-high, 460 GB/s. The A100 generation.
+- **HBM3 (2022):** 12-high, 819 GB/s. H100 generation. SK Hynix beat Samsung to market by 6+ months.
+- **HBM3E (2024):** 12-high, 1.2 TB/s. Blackwell generation. SK Hynix again first.
+- **HBM4 (2026):** 16-high stack, 2048-bit interface (doubled from 1024), targeting 1.6+ TB/s. The interface change is fundamental — HBM4 puts the logic die at the *base* of the stack rather than at the bottom of the DRAM stack, enabling tighter integration with the GPU.
+
+### The 4x wafer area problem
+
+Here's the math that makes memory a systemic bottleneck: **HBM consumes roughly 4x the DRAM wafer area per gigabyte compared to standard DDR5.** This is because HBM uses looser design rules (the TSVs and keep-out zones around them waste area), lower stack density than the latest DDR designs, and more process steps.
+
+HBM's share of total DRAM output is climbing rapidly — from ~5% in 2023 to ~23% projected for 2026. This directly crowds out consumer memory production. Micron exited its Crucial consumer brand entirely. SK Group's chairman warned that the conventional memory shortage could last 4–5 years.
+
+A single gigawatt of Rubin-class AI infrastructure requires approximately 170,000 DRAM wafer starts. Memory vendors are doubling or tripling HBM prices while locking in multi-year contracts. Nvidia has $90B in long-term supply contracts and is negotiating three-year deals with memory vendors.
+
+### The CoWoS bottleneck
+
+Even once you have the HBM stacks and the GPU die, you need to put them together. Advanced packaging — specifically TSMC's CoWoS (Chip-on-Wafer-on-Substrate) — has become its own bottleneck.
+
+CoWoS works like this: the GPU die and multiple HBM stacks are placed side-by-side on a large silicon interposer — essentially a thin sheet of silicon with wiring that connects everything. The interposer sits on top of an organic substrate that connects to the outside world. This is how an H100 or B200 module is assembled: one GPU die flanked by HBM stacks, all riding on a shared interposer.
+
+The problem is that the interposer keeps getting bigger as GPUs get larger and require more HBM stacks. The B200 uses a two-die GPU design partly because a single die would require an impossibly large interposer. TSMC has been aggressively expanding CoWoS capacity — from ~15K wafers/month in 2023 to ~40K/month by 2025 — but demand consistently outpaces supply.
+
+### The competitive landscape
+
+**SK Hynix** dominates HBM. They were first to HBM3, first to HBM3E, and are leading the HBM4 development cycle. Their close relationship with Nvidia (who validates and qualifies each HBM generation) gives them a structural advantage. SK Hynix supplies an estimated 50%+ of all HBM.
+
+**Samsung** has been playing catch-up. Their HBM3E yields lagged SK Hynix by ~6 months, and Nvidia reportedly rejected early Samsung HBM3E batches due to quality issues. But Samsung is the only company with both DRAM manufacturing *and* advanced foundry capabilities — which could matter for HBM4, where tighter logic-memory integration is required.
+
+**Micron** is the third player, with competitive HBM3E products and strong relationships with the U.S. government (CHIPS Act funding). Their 8-high HBM3E stack uses the least power per bit of the three vendors.
+
+**The investment lens:** The play is SK Hynix (HBM leader), Samsung (tied to the $73B memory investment), Micron, and SanDisk (SA increased their position 816% — that's the signal). Memory is a historically cyclical business that's becoming structurally tight due to HBM's 4x wafer area consumption.
+
+---
+
+## The foundry — from sand to silicon
+
+That GPU die and those HBM stacks were manufactured somewhere. The "somewhere" is almost certainly TSMC — and the process that created them is one of the most complex manufacturing chains in human history.
+
+### How a chip is actually made
+
+A modern processor starts as ordinary sand — silicon dioxide (SiO2). Through a chain of roughly 1,000 process steps spanning 3–4 months, that sand becomes the most complex object humanity manufactures.
+
+**Step 1: Crystal growth.** Silicon is purified to 99.999999999% purity (eleven nines) through the Siemens process, then melted at 1,414°C. A seed crystal is slowly pulled from the melt using the Czochralski method — rotating at ~1 RPM while pulling upward at ~1mm/min. Over 24+ hours, a single cylindrical crystal (ingot) forms, weighing up to 200kg. This ingot is sliced into wafers 300mm (12 inches) in diameter and polished to atomic smoothness.
+
+**Step 2: The wafer fab.** Each wafer goes through a repeating cycle: deposit a thin film → coat with photoresist → expose with lithography → develop → etch → strip resist → inspect. This cycle repeats dozens of times, building up layer after layer of transistors, interconnects, and metal wiring.
+
+The cleanroom itself is extraordinary. Class 1 cleanrooms have fewer than 1 particle per cubic foot larger than 0.5μm. Workers wear full bunny suits. The air is filtered 300–600 times per hour. A single speck of dust on a wafer at the 3nm node would be like a boulder sitting in the middle of a highway — it destroys every circuit it touches.
+
+**Step 3: Back-end processing.** After all layers are built, the wafer is tested (wafer probing), sliced into individual chips (dicing), packaged into their final form, and tested again. Advanced packaging (like CoWoS, discussed in the memory section) is becoming increasingly important and complex.
+
+### The process node naming game
+
+Here's something that confused me until I dug into it: **process node names stopped corresponding to actual transistor dimensions around 2010.**
+
+In the early days, "90nm" meant the gate length was literally 90 nanometers. The number tracked a real physical dimension. But starting around the 28nm node, foundries began using node names as marketing labels rather than measurements. Today's "3nm" transistors have gate lengths closer to 12nm, fin pitches around 25–30nm, and metal pitches around 21–24nm.
+
+The actual physical dimensions that matter are: **gate pitch** (spacing between transistor gates), **metal pitch** (spacing between wiring layers), and **transistor density** (transistors per square millimeter). TSMC's N3 achieves ~290M transistors/mm². Intel's competing "Intel 4" achieves ~250M/mm² despite having a nominally larger node name. The numbers on the label are vibes, not measurements.
+
+### Transistor architecture: the real scaling story
+
+The genuine innovations driving performance aren't wavelength reductions alone — they're fundamental changes to transistor geometry.
+
+<TransistorEvolution />
+
+**Planar MOSFETs (1960s–2011)** worked beautifully for decades. The gate electrode sits on top of a flat silicon channel, controlling current flow. But as dimensions shrank below ~22nm, the gate lost control. The channel became so thin that electrons could tunnel straight through the gate oxide. Leakage current — power consumed even when the transistor is "off" — became untenable.
+
+**FinFET (2012–2024)** was the breakthrough. Invented by Chenming Hu at UC Berkeley in 1999, the FinFET raises the channel into a vertical "fin" that the gate wraps around on three sides. This dramatically improves electrostatic control. Intel shipped the first production FinFETs at 22nm (Ivy Bridge, 2012). TSMC followed at 16nm, then 7nm, 5nm, and 3nm — all using variations of the FinFET architecture. The fin width got narrower each generation, the fins got taller, and more fins were packed per transistor. FinFETs dominated for over a decade.
+
+**Gate-All-Around / Nanosheet (2024+)** is the current transition. Instead of a vertical fin, the channel becomes a stack of horizontal nanosheets — thin ribbons of silicon that the gate wraps around on all four sides. Samsung shipped the first production GAA transistors at their 3nm node in 2022 (initially with poor yields). TSMC follows with their N2 process in 2025, and Intel plans GAA for their 20A and 18A nodes.
+
+The advantage of nanosheets is tunability — you can adjust the width of each sheet to optimize for performance (wider) or power efficiency (narrower), something FinFETs couldn't do. This flexibility matters enormously for AI accelerators that need both high-performance compute and power-efficient inference.
+
+**CFET (~2028+)** is what comes after GAA. Complementary FET stacks an NMOS transistor directly on top of a PMOS transistor — two transistors in the footprint of one. It's still in R&D at IMEC and the major foundries, but it represents the path to continued scaling beyond the limits of single-layer GAA.
+
+### The foundry landscape
+
+Three companies matter for leading-edge chip manufacturing:
+
+**TSMC (67% market share)** is the dominant force. Founded in 1987 by Morris Chang, who invented the pure-play foundry business model — the idea that a company could specialize in manufacturing chips designed by others, rather than every company building its own fab. This was considered crazy at the time. It turned out to be one of the most important business model innovations in technology history.
+
+TSMC's moat isn't just one thing. It's the compounding effect of decades of process engineering, a culture of meticulous execution (they call it "learning rate" — how fast yields improve after each node launch), deep customer relationships (Apple, Nvidia, AMD, Qualcomm all depend on TSMC), and massive capital expenditure ($32B+ per year). Their N3E process currently achieves yields above 80% for complex designs — a number that took years of refinement.
+
+**Samsung Foundry (7.3% market share)** has been struggling. Their 3nm GAA process launched in 2022 with yields reportedly below 20%, causing customer defections. But the picture is changing: their SF2 2nm GAA process has reached 55–60% yields. Tesla signed a $16.5B foundry contract — the largest long-term single-client deal ever. Meta is evaluating Samsung for MTIA accelerators. AMD may use Samsung for EPYC Venice and MI450.
+
+The price difference matters: TSMC's 2nm wafers cost $30K+ while Samsung offers $22–25K. In a supply-constrained world where hyperscalers *must* diversify away from TSMC, Samsung's improving yields and lower prices create a real opportunity. As Ben Thompson argues, the opportunity cost of being chip-constrained at decade's end vastly exceeds whatever it costs to make Samsung viable.
+
+**Intel Foundry** is the wildcard. Bleeding $2.5B per quarter. The 18A node is make-or-break. Intel 18A uses both GAA nanosheets and backside power delivery (running power wires underneath the transistors instead of competing for space with signal wires on top). If yields work by mid-2026, Intel becomes the second viable Western alternative to TSMC. Aschenbrenner held Intel call options while dumping the equity — maximum upside exposure, minimum dead capital. That's the right structure for a binary bet.
+
+### The geopolitics you can't ignore
+
+TSMC manufactures ~90% of the world's most advanced chips on a 200-square-mile island 100 miles off the coast of China. This concentration risk keeps defense planners awake at night.
+
+The CHIPS Act allocated $52.7B to incentivize domestic U.S. semiconductor manufacturing. TSMC is building 8 fabs in Arizona, targeting ~30% of advanced production at scale. Samsung is building in Taylor, Texas. Intel is expanding in Ohio, Arizona, and Oregon. But none of these fabs will produce at scale this decade. TSMC Arizona's first fab (N4 process) is targeting 2025 production; the more advanced fabs won't come online until 2028–2030.
+
+Meanwhile, China is spending heavily on mature-node capacity (28nm and above) through SMIC and others, and has produced some advanced chips using multi-patterning on DUV tools (circumventing the EUV export ban). But without access to EUV lithography — which the Dutch government, under U.S. pressure, has restricted — China cannot manufacture chips at the leading edge. This makes ASML export controls a geopolitical lever, and ASML's production capacity a strategic asset.
+
+---
+
+## EUV lithography — the machine that made the machine
+
+We've reached the bottom of the stack. Every advanced chip in the supply chain — the GPU, the HBM, the networking ASICs — was patterned using extreme ultraviolet light from an ASML machine. This is the ultimate bottleneck, and it has a 60-year history.
+
+### A 60-year journey to print with light
+
+Every advanced chip begins the same way: light is projected through a pattern onto silicon, and the exposed areas are chemically etched away. This is photolithography — the art of printing circuits with light. And the history of semiconductor scaling is largely the history of getting that light's wavelength shorter.
+
+**The early days (1960s–1980s).** The first lithography tools used contact printing — literally pressing a glass mask onto the wafer. It worked at micron scales but destroyed masks and contaminated wafers. Proximity printing added a small gap. Then projection lithography arrived, keeping the mask far from the wafer and using lenses to shrink the image.
+
+**Mercury arc lamps** provided the light source for decades. The industry standardized on specific mercury emission lines: g-line (436nm), then i-line (365nm). Each wavelength reduction enabled smaller features. By the late 1980s, i-line steppers could print features down to ~350nm.
+
+**The DUV revolution (1990s).** To go smaller, the industry needed shorter wavelengths than mercury could provide. Excimer lasers — gas lasers that produce intense UV pulses — became the answer. KrF (krypton fluoride) excimer lasers at 248nm arrived in the mid-1990s, enabling the 180nm node. Then ArF (argon fluoride) at 193nm took over for 130nm and 90nm.
+
+**Immersion lithography (2000s).** Here's a beautiful hack: instead of projecting light through air, fill the gap between the lens and wafer with ultra-pure water. Water has a refractive index of 1.44 at 193nm, effectively shrinking the wavelength to 134nm without changing the laser. TSMC's Lin Burn-jeng championed this approach. Combined with clever tricks like multiple patterning (exposing the same layer 2–4 times with shifted masks), immersion 193nm took the industry from 65nm all the way down to 7nm.
+
+But multiple patterning was getting absurd. A single metal layer at 7nm required *four separate exposures*. Each exposure adds cost, defect risk, and cycle time. The masks alone cost $10–15 million per set. The industry needed a fundamentally shorter wavelength.
+
+### The 40-year EUV saga
+
+The concept of using extreme ultraviolet light (13.5nm wavelength) for lithography dates to the 1980s at Bell Labs and the Lawrence Livermore National Laboratory. At 13.5nm, you could print features in a single exposure that required four passes with 193nm immersion. The physics was elegant. The engineering was nightmarish.
+
+**The problem with 13.5nm light is that it's absorbed by everything.** Air, glass, any conventional lens material. You can't use lenses at all — only mirrors. And even the best mirrors only reflect about 70% of EUV light per bounce. With 11 mirrors in the optical path, total throughput is 0.70^11 ≈ 2%. Ninety-eight percent of your light is lost before it reaches the wafer.
+
+This single fact — 2% optical efficiency — drove every engineering nightmare that followed.
+
+**The light source problem.** You need an insanely powerful light source to compensate for that 2% throughput. The solution, which took decades to develop: fire a high-power CO2 laser (now 50kW) at tiny tin droplets falling through a vacuum chamber at 50,000 drops per second. Each droplet is hit twice — first a pre-pulse that flattens it into a pancake shape, then the main pulse that vaporizes it into a 500,000°C plasma. That plasma emits EUV photons at exactly 13.5nm.
+
+Getting this to work reliably was a multi-decade effort. Early prototypes produced a few watts of EUV power. Production tools need 250–500W. Each generation of source power roughly doubled throughput. The breakthrough came when ASML and Trumpf (the laser source supplier) achieved the "1000W source" milestone in late 2024, enabling 200+ wafers per hour — finally matching DUV tool productivity.
+
+**The mirror problem.** Each mirror in an EUV system is a stack of ~80 alternating layers of molybdenum and silicon, each a few nanometers thick. The surface must be flat to within 0.02nm — less than the diameter of a single atom. Carl Zeiss SMT in Oberkochen, Germany, is the only company in the world that can make these mirrors. They have been working on EUV optics since the 1990s.
+
+If you measured the surface deviation of a Zeiss EUV mirror scaled up to the size of Germany, the tallest bump would be 0.1mm.
+
+**The mask problem.** EUV masks are reflective (not transmissive like DUV masks), adding another engineering challenge. They use the same Mo/Si multilayer coating as the mirrors, with an absorber pattern on top. A single particle of contamination — even a few nanometers — can print defects on every wafer. Mask inspection and repair at EUV wavelengths remains one of the hardest problems.
+
+**Failed consortia and ASML's bet.** Through the 1990s and 2000s, multiple industry consortia tried and failed to commercialize EUV. The EUV LLC consortium (Intel, AMD, Motorola, etc.) burned through hundreds of millions of dollars. Nikon — which dominated DUV lithography alongside Canon — attempted their own EUV program and eventually abandoned it. Canon exited entirely.
+
+ASML, the Dutch company that had been gaining DUV market share through the 2000s, made the critical decision to bet the company on EUV. They acquired Cymer (the leading DUV light source company) in 2013 for $3.7B, gaining the expertise needed for the EUV source. Intel, TSMC, and Samsung each invested $1–4B directly into ASML to fund EUV development — an unprecedented move by customers funding a supplier.
+
+**First production (2019).** After roughly $10 billion in total R&D and 40 years of development, ASML shipped the first production EUV tools (NXE:3400B) in 2019. Samsung and TSMC used them for 7nm and 5nm nodes. The tools cost ~$150M each at the time.
+
+**Today.** ASML's current production tool, the NXE:3800E, costs $380M and processes ~200 wafers per hour. They ship approximately 70 EUV systems per year and are ramping toward ~100 by decade's end. Each tool weighs ~180 tons, requires 40 shipping containers, and contains 100,000+ parts sourced from ~800 suppliers.
+
+### High-NA EUV: the next step
+
+ASML's next-generation system, the EXE:5000 (High-NA EUV), increases the numerical aperture from 0.33 to 0.55 — enabling smaller features for the 2nm generation and beyond. The first tools shipped in 2024 to Intel and TSMC for R&D. They cost upwards of $380M each, require even more complex optics (anamorphic mirrors with different magnification in x and y directions), and won't reach high-volume manufacturing until 2026–2027.
+
+High-NA reduces the minimum printable feature size by ~1.7x. But it also halves the field size, meaning each exposure covers less area on the wafer. The industry is still figuring out stitching strategies to handle this trade-off.
+
+### The trilateral monopoly
+
+Here's what makes EUV the ultimate bottleneck: three companies, zero alternatives.
+
+<EUVSupplyChain />
+
+No other company has attempted to build an EUV system since Nikon exited. The barriers aren't just capital — it's that the knowledge is distributed across these three companies and decades of iterative engineering. You can't replicate 40 years of accumulated know-how by throwing money at the problem.
+
+### The hard ceiling math
+
+ASML currently makes about 70 EUV tools per year. Even under aggressive expansion, they hit maybe 100 per year by decade's end. Cumulative installed base: ~700 tools. At 3.5 EUV tools per gigawatt of Rubin-class chips, that's a theoretical ceiling of ~200 GW per year — and that's *if every single tool were allocated to AI*, which obviously won't happen.
+
+For context, there's about 20 GW of AI deployed globally right now. Sam Altman wants a gigawatt per week by 2030 (~52 GW/year). The math simply doesn't work for all the major labs simultaneously. This is the binding constraint of the decade.
+
+**The investment lens:** ASML trades at roughly 30x forward earnings. The bull case is that AI demand makes their order book durable for the rest of the decade with pricing power on every tool. The bear case is cyclicality — if non-AI chip demand softens, ASML's overall utilization could dip even if AI demand is strong. But the key insight is that ASML's production capacity is the hard ceiling on *all* advanced chip manufacturing globally. There is no substitute. There is no second source.
+
+---
+
+## The demand accelerant
+
+Here's where it gets really interesting. Claude Code is at 4% of GitHub commits today and expected to hit 20% by year-end. Autonomous task horizons are doubling every 6–7 months. Each doubling unlocks more of the information-work TAM.
+
+As Eric Jang wrote: *"I don't think people have begun to fathom how much inference compute we will need. Even if you think you are AGI-pilled, I think you are still underestimating how starved of compute we will be."*
+
+The key transition: ChatGPT/API was Web 1.0 — static request/response. Claude Code and agents are Web 2.0 — dynamic orchestration. The protocol (raw token generation) becomes the means, not the end. Trillions in value in the orchestration layer. But that layer's growth is throttled by every bottleneck above it.
+
+---
+
+## Live tracker
+
+Here's the index in real time, weighted by the allocation thesis:
+
+<ComputeIndexTracker />
+
+And here's how the index and individual positions have performed over time:
+
+<ComputeIndexPerformance />
+
+---
+
+## The allocation
+
+Here's how I'm thinking about deploying capital across the stack. Weighted by bottleneck tightness, asymmetry, and time horizon.
+
+<AllocationTable />
+
+<VerdictBox label="Key allocation principles">
+<p><strong>Weight toward the moving bottleneck.</strong> ~45% in the semiconductor layer (ASML + TSMC + Samsung) because that's where the constraint is tightening. ~15% in memory. ~21% in chip designers. ~16% in infrastructure and networking. ~3% in optionality.</p>
+<p><strong>Match time horizon to bottleneck timing.</strong> Neocloud positions can be shorter duration. Foundry and memory are 2026–28 plays. ASML is the longest-duration hold — the constraint that tightens last but matters most.</p>
+<p><strong>Use options where conviction is binary.</strong> Intel calls are a turnaround-or-bust bet. Defined loss, asymmetric upside.</p>
+</VerdictBox>
+
+---
+
+## Benchmarking against Situational Awareness LP
+
+Leopold Aschenbrenner's fund filed a 13F showing $5.5B in gross exposure on $383M AUM (~14x leverage). 29 holdings. Here's how it maps:
+
+<SAPortfolioTable />
+
+### Where we agree
+
+**Physical infrastructure over algorithms.** SA holds zero model company equity and zero pure software. Every dollar is in the physical substrate. Our framework agrees — margin flows to bottleneck owners, not to companies spending on the bottleneck.
+
+**Memory is accelerating.** SA's 816% increase in SanDisk confirms the thesis. OpenAI has reportedly committed to consume up to 40% of global DRAM capacity.
+
+**Optical networking is underappreciated.** Lumentum ($479M) and Coherent ($89M) are SA's 4th and 11th largest positions. Data movement scales non-linearly with cluster size.
+
+**The Intel structure is instructive.** Selling 20.2M common shares to exactly 1 while keeping 20.2M call options. Masterclass in capital efficiency for binary outcomes.
+
+### Where we diverge
+
+**SA has no ASML, no TSMC, no Samsung Foundry.** This is the biggest gap. Our framework allocates ~45% to the semiconductor layer. SA likely thinks foundry is correctly priced while infra is mispriced — a shorter time horizon bet.
+
+**SA has no Nvidia.** Zero direct exposure. We have 14%. SA may be betting margin migrates from chip designers to infrastructure providers.
+
+**SA is heavily weighted to neoclouds and BTC miners.** CoreWeave ($1.2B), Core Scientific ($419M), IREN ($329M), Applied Digital ($278M), Cipher ($155M). We have lighter neocloud exposure. SA makes a much more aggressive bet on GPU hosting margin expansion. High conviction, high risk.
+
+**The leverage.** ~14x gross leverage means SA is structurally fragile if timing is off. This reinforces diversification across the stack rather than concentration.
+
+<VerdictBox label="Updated adjustments based on SA crossover">
+<p><strong>Memory: added SNDK alongside SK Hynix / MU.</strong> SA's 816% increase is the signal.</p>
+<p><strong>Networking: increased LITE / COHR to 7%.</strong> Lumentum as SA's 4th-largest position validates cluster-scale optical interconnect.</p>
+<p><strong>No power exposure.</strong> Best gains are behind us, and power is a cost — not a constraint — on GPU TCO.</p>
+</VerdictBox>
+
+---
+
+## Questions I keep asking
+
+Adapted from Thiel's four monopoly sources. I track these quarterly.
+
+<Scorecard />
+
+---
+
+## What breaks the thesis
+
+I'd be dishonest if I didn't lay out the risks.
+
+**Demand collapse.** If AI models stop improving or adoption stalls, the entire capex cycle looks like overbuilding. Patel's counter: the revenue is real ($60B+ Anthropic trajectory, Nvidia $216B rev). But the dot-com scenario is always possible.
+
+**Algorithmic efficiency.** If models get dramatically more efficient — 10x fewer FLOPs for same quality — hardware demand could plateau. Watch for architectural breakthroughs.
+
+**Taiwan.** China's Five-Year Plan language has shifted. A blockade or attack on TSMC would be catastrophic for this entire portfolio. TSMC Arizona (8 fabs planned, ~30% of advanced production at scale) is the hedge but won't be ready this decade.
+
+**Regulatory.** Antitrust, export controls, energy policy. Currently the US government is encouraging the buildout, not constraining it.
+
+**Concentration risk.** This portfolio is extremely correlated to one macro thesis. If inference demand curves flatten, everything moves against you simultaneously. Size accordingly.
+
+---
+
+*This is a research synthesis, not financial advice. It draws from Dylan Patel / SemiAnalysis, Ben Thompson / Stratechery, Daniel Gross / AGI Trades, Leopold Aschenbrenner / Situational Awareness LP 13F, Eric Jang, and the SemiAnalysis Claude Code thesis. All data as of March 2026. Do your own research. Size positions to what you can afford to lose.*

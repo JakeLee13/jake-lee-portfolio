@@ -1,3 +1,4 @@
+import Link from "next/link"
 import { GraphBlob } from "@/components/GraphBlob"
 import { FaGithub, FaLinkedin, FaXTwitter, FaEnvelope } from "react-icons/fa6"
 
@@ -7,7 +8,7 @@ export default function Home() {
       <div className="w-full max-w-6xl grid lg:grid-cols-2 gap-20 items-start">
         {/* Left side - Content */}
         <div className="max-w-md lg:justify-self-end pt-12">
-          {/* Header with name */}
+          {/* Header with name and nav */}
           <header className="mb-8">
             <h1 className="text-3xl font-bold text-black dark:text-white">
               Jake Lee
@@ -60,6 +61,16 @@ export default function Home() {
               </a>
             </div>
           </section>
+
+          {/* Blog link */}
+          <nav className="mt-6">
+            <Link
+              href="/blog"
+              className="text-sm text-gray-500 dark:text-gray-500 hover:text-black dark:hover:text-white transition-colors"
+            >
+              Blog
+            </Link>
+          </nav>
         </div>
 
         {/* 3D Graph - below on mobile, right side on desktop */}

@@ -6,3 +6,48 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
+
+/* rehype-pretty-code styles */
+[data-rehype-pretty-code-figure] pre {
+  @apply overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-800 py-4 text-sm leading-relaxed;
+}
+
+[data-rehype-pretty-code-figure] code {
+  @apply grid;
+  counter-reset: line;
+}
+
+[data-rehype-pretty-code-figure] [data-line] {
+  @apply px-4;
+}
+
+/* Inline code (not inside pre blocks) */
+:not(pre) > code {
+  @apply rounded bg-gray-100 px-1.5 py-0.5 text-sm font-mono dark:bg-gray-800;
+}
+
+/* Override prose inline code backtick styling */
+.prose :where(code):not(:where([class~="not-prose"], [class~="not-prose"] *))::before,
+.prose :where(code):not(:where([class~="not-prose"], [class~="not-prose"] *))::after {
+  content: "" !important;
+}
+
+/* Dual-theme syntax highlighting: apply light colors by default */
+[data-rehype-pretty-code-figure] span {
+  color: var(--shiki-light);
+}
+
+[data-rehype-pretty-code-figure] pre {
+  background-color: var(--shiki-light-bg, #fff);
+}
+
+/* Switch to dark colors in dark mode */
+@media (prefers-color-scheme: dark) {
+  [data-rehype-pretty-code-figure] span {
+    color: var(--shiki-dark);
+  }
+
+  [data-rehype-pretty-code-figure] pre {
+    background-color: var(--shiki-dark-bg, #24292e);
+  }
+}
