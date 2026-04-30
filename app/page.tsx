@@ -17,8 +17,8 @@ export default function Home() {
 
           {/* About text without heading */}
           <section className="mb-8">
-            <p className="text-gray-700 dark:text-gray-300 leading-relaxed">
-              Interested in lots of data things. Studied Statistics and Quantitative Analysis at the University of Utah. Based out of Salt Lake City. Currently doing analytics at Domo.
+            <p className="text-gray-700 dark:text-gray-300 leading-relaxed w-[70%]">
+              Interested in lots of data things. Studied Statistics and Quantitative Analysis at the University of Utah. Based out of Salt Lake City. Currently working on AI at Domo.
             </p>
           </section>
 
