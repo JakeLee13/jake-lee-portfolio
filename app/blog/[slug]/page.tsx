@@ -6,9 +6,7 @@ import rehypePrettyCode from "rehype-pretty-code";
 import rehypeSlug from "rehype-slug";
 import { getAllSlugs, getPost } from "@/lib/blog";
 import { PipelineDiagram } from "@/components/blog/PipelineDiagram";
-import { StageTable } from "@/components/blog/StageTable";
 import { ComparisonTable } from "@/components/blog/ComparisonTable";
-import { CrmGapTable } from "@/components/blog/CrmGapTable";
 import { SdkComparison } from "@/components/blog/SdkComparison";
 import { ComputeInsightCards } from "@/components/blog/ComputeInsightCards";
 import { BottleneckTimeline } from "@/components/blog/BottleneckTimeline";
@@ -18,14 +16,20 @@ import { SAPortfolioTable } from "@/components/blog/SAPortfolioTable";
 import { VerdictBox } from "@/components/blog/VerdictBox";
 import { ComputeIndexTracker } from "@/components/blog/ComputeIndexTracker";
 import { BlogImage } from "@/components/blog/BlogImage";
-import { BlogVideo } from "@/components/blog/BlogVideo";
 import { EUVSupplyChain } from "@/components/blog/EUVSupplyChain";
 import { TransistorEvolution } from "@/components/blog/TransistorEvolution";
 import { HBMStackDiagram } from "@/components/blog/HBMStackDiagram";
 import { GPUEvolution } from "@/components/blog/GPUEvolution";
 import { DataCenterDiagram } from "@/components/blog/DataCenterDiagram";
-import { InferenceFlow } from "@/components/blog/InferenceFlow";
+import { InferencePhases } from "@/components/blog/InferencePhases";
+import { RequestPath } from "@/components/blog/RequestPath";
 import { ConsumptionModes } from "@/components/blog/ConsumptionModes";
+import { FiveMultipliers } from "@/components/blog/FiveMultipliers";
+import { MarginStack } from "@/components/blog/MarginStack";
+import { RotationTable } from "@/components/blog/RotationTable";
+import { CatalystWatch } from "@/components/blog/CatalystWatch";
+import { SourceNote } from "@/components/blog/SourceNote";
+import { ProvenanceLegend } from "@/components/blog/ProvenanceLegend";
 import { LayerPipeline } from "@/components/blog/revradar/LayerPipeline";
 import { ContextFunnel } from "@/components/blog/revradar/ContextFunnel";
 import { ActionRoutingFlow } from "@/components/blog/revradar/ActionRoutingFlow";
@@ -36,9 +40,7 @@ import type { Metadata } from "next";
 
 const mdxComponents = {
   PipelineDiagram,
-  StageTable,
   ComparisonTable,
-  CrmGapTable,
   SdkComparison,
   ComputeInsightCards,
   BottleneckTimeline,
@@ -48,14 +50,20 @@ const mdxComponents = {
   VerdictBox,
   ComputeIndexTracker,
   BlogImage,
-  BlogVideo,
   EUVSupplyChain,
   TransistorEvolution,
   HBMStackDiagram,
   GPUEvolution,
   DataCenterDiagram,
-  InferenceFlow,
+  InferencePhases,
+  RequestPath,
   ConsumptionModes,
+  FiveMultipliers,
+  MarginStack,
+  RotationTable,
+  CatalystWatch,
+  SourceNote,
+  ProvenanceLegend,
   LayerPipeline,
   ContextFunnel,
   ActionRoutingFlow,

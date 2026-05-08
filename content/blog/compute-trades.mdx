@@ -1,64 +1,273 @@
 ---
 title: "Compute Trades [In Progress]"
-date: "2026-03-19"
-description: "I typed a request into Claude Code. What actually happened? A deep dive from token generation to EUV lithography — tracing every layer of the AI compute supply chain."
+date: "2026-04-23"
+description: "I typed a request into Claude Code. What actually happened? A deep dive through the inference serving stack and the bottleneck rotation up the supply chain — to the $380M machines that gate it all."
 ---
 
-In Claude Code: 
+In Claude Code:
 
 > "Add dark mode functionality to my blog."
 
 A few minutes later, seven files were edited, tests passed, and dark mode worked. From keystroke to commit, maybe 4 minutes of wall-clock time.
 
-But what actually happened in those 4 minutes? Where did my request go? What hardware processed it? What about the tokens? What physical infrastructure made it possible? 
+But what actually happened in those 4 minutes? What hardware processed it? What physical infrastructure made it possible? And most importantly — **who captures the margin when millions of users run the same kind of agentic loop simultaneously?**
 
-This post traces a single inference request through every layer of the AI compute supply chain — from the software that tokenizes my words, to the GPU that generates the response, to the memory that holds the model's state, to the foundry that manufactured the chip, to the $380 million machine that printed the circuits. 
+This post traces a single inference request through the serving stack that produces it, down the supply chain that builds the hardware, and into the margin stack that decides where capital should go.
 
-Inspired by Daniel Gross's AGI Trades. Partially to deeply understand the full stack and constraints, partially to try and make some money.
+Inspired by Daniel Gross's AGI Trades. Partially to deeply understand the stack. Partially to try and make some money.
+
+<ProvenanceLegend />
+
+**On sourcing.** Most of this post's numbers come from one of three kinds of source: peer-reviewed papers and company disclosures I can check directly, SemiAnalysis's own tracking and benchmark products, and Dylan Patel's podcast appearances (Dwarkesh March 2026; Invest Like The Best April 2026). A named analyst's assertion on a podcast is evidence — it's a signal that a well-positioned observer believes something — but it is not fact. Where possible I point to the underlying data; where I can't, I say so. The full source dossier lives in the `/knowledge/` folder of this repo.
 
 ---
 
 ## What actually happened
 
-Here's the step-by-step path of my request, from keystroke to response:
+Here's the step-by-step path of my request, from keystroke to response — every operation tagged with the hardware it actually runs on:
 
-<InferenceFlow />
+<RequestPath />
 
-Let me walk through the parts that matter most.
+That diagram is accurate but it hides the single most important fact about modern inference. Every request goes through **two phases with fundamentally different hardware profiles**, and every serving technique invented in the last five years is a response to the same asymmetry.
 
-### Tokenization
+<InferencePhases />
 
-When I typed "add dark mode to the blog," Claude Code didn't send those words directly. It packaged my entire conversation — system prompt, tool schemas, previous messages, file contents from earlier reads — into a single API request. That request might contain 50,000+ tokens of context.
+Prefill processes the entire prompt in parallel — one big matrix multiplication per layer. The roofline threshold that decides compute-bound vs memory-bound on H100 SXM5 is `peak_FLOPs / peak_bandwidth` = 989 TFLOPS / 3.35 TB/s ≈ **~295 FLOPs/byte** at BF16. Prefill's QKV projection runs at roughly `2 · n / dtype_bytes` FLOPs/byte where `n` is sequence length, so a 4K-token prompt in BF16 lands at ~4,000 FLOPs/byte — an order of magnitude past the threshold. Prefill is **compute-bound**. Then generation starts. The decode matmul is the clean inverse: batch-1, seq-1 math means the weight read dominates, giving exactly **1 FLOP/byte at BF16, 2 at FP8, 4 at FP4** — reading 2d² bytes of weights to do 2d² FLOPs. That's ~0.3% of peak against the 295 threshold. Decode is **memory-bandwidth-bound**. The wall-clock floor per token is `model_weight_bytes / HBM_bandwidth`: Llama-3 70B at BF16 is 140 GB / 3.35 TB/s ≈ **42 ms/token** on a single H100 at theoretical peak. The same GPU does both phases. You pay for both cycles. One of them runs under-utilized. <SourceNote tier="primary">Roofline analysis: Williams et al. 2009. H100 spec: Nvidia. Per-token wall-clock derivation: JAX ML Scaling Book (roofline chapter). Serving-system framing: Sarathi-Serve (arXiv:2403.02310), Splitwise (arXiv:2311.18677).</SourceNote>
 
-The text gets split into subword tokens using Byte Pair Encoding (BPE). Common sequences get their own token ("ing", "tion", " the"). Rare words get broken into pieces. Roughly 4 characters per token, or ~150 tokens per 100 words. The tokenizer is deterministic — the same input always produces the same tokens.
+Batching is what keeps decode from being a catastrophe. With B concurrent decode requests sharing the same weight read, effective intensity becomes `B / dtype_bytes` — a B=64 continuous batch at BF16 gives ~16 FLOPs/byte, still bandwidth-bound but tensor-core utilization lifts from `<1%` of peak to the ~28% you see in InferenceMAX-style production numbers. The hardware isn't sitting idle; it's being paid for to wait on memory, and batching converts that waiting into useful work.
 
-### Prefill and the KV cache
+This asymmetry is why modern serving is choreography for GPUs, not a single function call.
 
-Here's where the GPU work begins. During the "prefill" phase, the model processes all input tokens in parallel — computing attention across the full context. This produces Key and Value matrices for every token at every layer of the transformer.
+### Embeddings — what happens when a token first hits the GPU
 
-These KV matrices get cached in the GPU's HBM (High Bandwidth Memory). For a 200K-token context window on a large model, the KV cache alone can consume 10–50 GB of HBM. This is why memory bandwidth matters so much for inference — the model isn't doing heavy arithmetic. It's reading and writing massive amounts of cached state.
+Before attention, before MLPs, every token takes a trip through the embedding matrix. The tokenizer produces an integer ID; the embedding layer looks up row `ID` of a `vocab_size × hidden_size` table and returns a vector. That vector is the token's entire presence on the GPU from that point on — everything downstream is math on these.
 
-Every subsequent output token only needs to compute attention against the *cached* keys and values from all previous tokens, rather than reprocessing the entire input. This turns what would be O(n²) computation into O(n) per token — the KV cache is the single most important optimization for fast inference.
+The matrix is bigger than people intuit. **Llama-3 70B:** `vocab_size = 128,256`, `hidden_size = 8,192`. At BF16 that's `128,256 × 8,192 × 2 bytes ≈ 2.10 GB`. Because Llama-3 does *not* tie input and output embeddings, a second matrix of identical size (`lm_head`) sits at the end of the stack — **~4 GB combined** dedicated to embedding lookup and unembedding projection. Under tensor parallelism this gets sharded along the vocab dimension (Megatron's `VocabParallelEmbedding`): at TP=8, each rank holds 16,032 vocab rows × 8,192 cols and an all-reduce (forward embedding) or all-gather (final `lm_head`) sits on the critical path. <SourceNote tier="primary">Llama-3 config.json (HuggingFace). Megatron-LM `VocabParallelEmbedding` documentation; Meta's reference Llama inference code uses it.</SourceNote>
 
-### Mixture of Experts
+**Tying matters more than people think.** The "tied embeddings" trick (share weights between input embedding and output projection) was formalized by Press & Wolf (2017). <SourceNote tier="primary">Press & Wolf, "Using the Output Embedding to Improve Language Models," arXiv:1608.05859 (v3 2017).</SourceNote> The 2026 pattern across open-weights models: **large models untie, with one important exception.** Llama-3/3.1, DeepSeek-V3, Qwen 2.5 at 7B+, GPT-OSS 120B — all untied (verified from their `config.json` files). The exception is **Gemma 2**, which ties even at 27B — because Gemma's vocab is 256,000 tokens (roughly 2× Llama), making an untied `lm_head` disproportionately expensive. Tying saves ~2–8 GB per model depending on size. For inference servers juggling many models per GPU fleet, that saving adds up. <SourceNote tier="primary">Verified from the public HuggingFace `config.json` for each model: Llama-3.1-70B, DeepSeek-V3, Qwen2.5-72B, GPT-OSS-120B, Gemma-2-27B.</SourceNote>
 
-If the model uses a Mixture of Experts architecture (as many frontier models do), not every parameter activates for every token. A learned router network examines each token and selects which "expert" subnetworks should process it — typically 2 out of 8 or 16 experts.
+**The `lm_head` cost at decode time is model-dependent.** For dense Llama-3 70B it's ~1 billion FLOPs per output token — roughly 2% of the per-step decode compute dominated by the 80 layers of attention and MLP. Small number, not interesting. For MoE models, where only ~5% of parameters activate per token (GPT-OSS 120B: 117B total, ~5B active), `lm_head` can become a visible fraction of decode work because the active body shrank. For models with very large vocabs (Gemma 2's 256K) combined with small bodies, the same holds. "lm_head is a meaningful decode cost" is true in the MoE + large-vocab regime; it is **not** true universally. <SourceNote tier="derived">FLOP accounting from standard transformer math. Primary data: config files above. "2%" figure is my calculation; profile your own workload before leaning on it.</SourceNote>
 
-This means a model with 300B+ total parameters might only activate ~75B per forward pass. You get the quality of a massive model with the speed of a much smaller one. But it creates an engineering challenge: the *entire* model still needs to fit in memory (all experts must be loadable), even though only a fraction runs per token. This is another reason HBM capacity matters.
+**Positional encoding is where long-context extension actually happens.** Modern models use Rotary Position Embedding (RoPE) rather than learned position embeddings — positional information is injected at each attention layer by rotating the Q and K vectors as a function of position. <SourceNote tier="primary">Su, Lu, Pan, Murtadha, Wen, Liu, "RoFormer: Enhanced Transformer with Rotary Position Embedding," arXiv:2104.09864 (2021).</SourceNote> The point of RoPE for inference is that a model trained at 8K context can be extended to 128K or 200K without retraining from scratch — you rescale the rotation frequencies. Three approaches compete:
 
-### The agentic loop
+- **NTK-aware scaling** (zero-shot; no training required) — originated in a r/LocalLLaMA community post rather than a paper, later formalized. Works with some quality degradation at the high end. <SourceNote tier="derived">Canonical reference is the r/LocalLLaMA post by `bloc97` (June 2023), not peer-reviewed. Formalization in YaRN paper below.</SourceNote>
+- **YaRN** (Peng et al., 2023) — the published SOTA for RoPE extension. Per the paper: matches SOTA quality after fine-tuning on under 0.1% of original pretraining tokens, 10× fewer tokens than prior methods. **Not training-free** — a common misconception. Used by DeepSeek-V3 and GPT-OSS 120B. <SourceNote tier="primary">Peng, Quesnelle, Fan, Shippole, "YaRN: Efficient Context Window Extension of Large Language Models," arXiv:2309.00071.</SourceNote>
+- **Meta's "llama3" scaling** for Llama-3.1 128K — a custom frequency-dependent scheme (low-frequency components scaled by factor 8, high-frequency left alone, smooth interpolation between). Shipped with ~800B tokens of gradual continued pre-training in 6 stages, not a fine-tune. <SourceNote tier="primary">Llama 3 paper, arXiv:2407.21783. Config parameters (`rope_type="llama3"`, `factor=8.0`, `low_freq_factor=1.0`, `high_freq_factor=4.0`) verified in Meta's published Llama-3.1 config.</SourceNote>
 
-This is what makes Claude Code different from ChatGPT.
+The investment-relevant fact: **long context is a software extension, not an architectural rebuild.** A lab can ship a 200K-context variant of a trained model by burning under 1% of original pretraining compute on RoPE scaling. This is why context windows keep growing faster than model generations do, and why the KV cache sized below — which scales linearly with context length — dominates HBM for production serving.
 
-After the model generates a response, it might include a structured tool call: `Read("app/globals.css")`. At this point, generation pauses. Claude Code executes the tool *locally on my machine* — reading the file from my filesystem. The file contents get appended to the conversation context. Then inference resumes on the remote GPU cluster with the new context.
+### The KV cache — where long context actually costs
 
-For my "add dark mode" request, this loop repeated maybe 15–20 times: read files, search for patterns, edit files, read the results, run tests, report back. Each iteration is a full round-trip — local tool execution, then another inference call to the GPU cluster. The model maintains coherent reasoning across all of these turns because the full conversation context (including tool results) is sent with each request.
+The KV cache stores the K and V projections for every past token so decode doesn't recompute them. The size formula is exact: `KV_bytes = 2 × n_layers × n_kv_heads × head_dim × seq_len × batch × dtype_bytes` (the leading 2 is because you cache both K and V; `n_kv_heads` is the post-GQA count, not query heads). For **Llama-3 70B** (80 layers, 8 KV heads, head_dim 128, BF16): per-token cache is `2 × 80 × 8 × 128 × 2 = 327,680 bytes ≈ 320 KB/token`. At 128K context, one user: **~40 GB**. The weights themselves take ~140 GB at BF16. On an 80 GB H100, one concurrent long-context user eats the remaining headroom after weight sharding; a realistic long-context 70B rig is 4–8 GPUs per replica, and the deciding factor is KV, not weights. A hypothetical MHA variant (n_kv_heads = 64 query heads) would demand ~2.5 MB/token — 335 GB at 128K, larger than the weights. GQA is the reason the model is deployable at all. <SourceNote tier="primary">Llama-3 model card (Meta). H100 specs (Nvidia). KV formula derivation: standard; see LMCache KV calculator for interactive check.</SourceNote>
 
-### The physical path
+This is why:
 
-My request traveled: MacBook → home WiFi → ISP → internet backbone → load balancer → API gateway → GPU cluster → specific GPU → back through the chain. Network round-trip: ~50–200ms. The inference itself — prefill plus hundreds of decode steps — takes seconds. Streaming means I see tokens arrive in real-time rather than waiting for the full response.
+- **DeepSeek's MLA** (Multi-head Latent Attention) is as important as their MoE. MLA projects K and V into a shared low-rank latent (DeepSeek-V3 uses d_c=512 against a 16,384-wide effective attention space) and reconstructs at attention time. Per-token cache: ~70 KB, vs ~320 KB on a Llama-3-style GQA-8 baseline at comparable dimensions. The DeepSeek-V2 paper reports ~14× compression against MHA — but MHA is the wrong comparison class since every frontier model uses GQA. The **honest framing is ~4× smaller than frontier GQA at matched quality**. The tradeoff: MLA's up-projections burn extra compute per decode step and FlashAttention doesn't support the MLA shape yet, which is why adoption outside DeepSeek has been slow despite ACL 2025 work showing MLA can be retrofitted via distillation. <SourceNote tier="primary">DeepSeek-V2 paper (arXiv:2405.04434); DeepSeek-V3 technical report (arXiv:2412.19437); "Towards Economical Inference" (ACL 2025).</SourceNote>
+- **Anthropic's prompt-caching discount** effectively prices KV-cache residency. Cached input token reads bill at ~10% of base input pricing; cache writes bill at ~125%. Working it through for a 20-turn Claude Code session with a 50K-token stable prefix: turn 1 pays 1.25× on 50K (a write), turns 2–20 pay 0.1× on 50K (reads), plus each turn's small delta at full rate. Amortized input rate drops from $3/M to roughly $0.50/M — the ~6× effective reduction that turns agents from uneconomic to routine. The gotcha: the 1.25× write premium means any inadvertent cache invalidation (a timestamp in the system prompt, tool-result ordering changes, UUID leaks) silently inflates cost 2–5× because you're writing instead of reading. Claude Code's 84–92% cache hit rate is the outcome of aggressive prefix-stability engineering, not a feature that works by default. <SourceNote tier="primary">Anthropic prompt-caching pricing page; Anthropic Claude Code docs on cost management.</SourceNote>
+- Google's TurboQuant (Feb 2026) demonstrated lossy KV compression via random rotation plus precomputed Gaussian codebooks. That memory stocks (Micron, Western Digital, SanDisk) sold off meaningfully on publication is widely-observed but the exact daily move is worth checking before citing. <SourceNote tier="derived">TurboQuant paper (Google, Feb 2026); day-of-publication memory-stock reaction reported by SemiAnalysis and Caleb Writes Code commentary.</SourceNote>
 
-The GPU cluster that processed my request is probably running on CoreWeave, GCP, or AWS infrastructure. Thousands of GPUs in liquid-cooled racks, connected by InfiniBand networking, drawing tens of megawatts of power. My single request used a fraction of one GPU for a few seconds. But multiply that by millions of concurrent users, and you start to see why the supply chain matters.
+**KV cache quantization is the other lever — and it's what production actually runs.** MLA and TurboQuant are architectural; KV quantization is a post-hoc compression applied to the cache itself at serving time. The levers, in order of production maturity:
+
+- **INT8 KV cache** — shipping in vLLM (`kv_cache_dtype="fp8_e4m3"` or `"int8"`) and TensorRT-LLM (`--int8_kv_cache` with calibration). 2× smaller than BF16 with minimal quality degradation on standard benchmarks, per both frameworks' docs. Specific perplexity deltas depend on model and task — don't treat "sub-half-percent drift" as a universal figure. <SourceNote tier="primary">vLLM quantized KV cache docs; TensorRT-LLM quantization examples.</SourceNote>
+- **FP8 KV cache** — also in vLLM and TRT-LLM; requires Hopper / Ada / Blackwell. NVIDIA explicitly recommends FP8 over INT8 on Hopper-class hardware because FP8's dynamic range preserves activation outliers better than INT8's linear quantization. <SourceNote tier="primary">NVIDIA TensorRT-LLM quantization guide.</SourceNote>
+- **NVFP4 KV on Blackwell** — SM100 (datacenter Blackwell) only today; NVIDIA's own blog reports **50% KV memory reduction versus FP8 at under 1% accuracy loss** using ModelOpt offline calibration, currently paired with FP8 weights. Consumer Blackwell (SM120) support is still an open TRT-LLM issue. This is the lever Blackwell-era inference throughput wins depend on most. <SourceNote tier="primary">NVIDIA Developer Blog, "Optimizing Inference for Long Context and Large Batch Sizes with NVFP4 KV Cache."</SourceNote>
+- **INT4 / 2-bit KV** — research-grade. **KIVI** (Liu et al., ICML 2024) is the notable result: 2-bit asymmetric quantization with per-channel for keys and per-token for values, tuning-free, near-lossless on LongBench / GSM8K per the paper's tables. Not in production serving frameworks as a first-class feature as of this writing. <SourceNote tier="primary">Liu, Yuan, Jin, Zhong, Xu, Braverman, Chen, Hu, "KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache," arXiv:2402.02750.</SourceNote>
+
+**Another lever: don't cache what you don't need.** Two classes of technique bound KV size by architecture or eviction rather than compression:
+
+- **Sliding-window attention** (Mistral 7B, Jiang et al. 2023) restricts each layer's attention to a fixed window — window W=4096 in Mistral, information propagated to tokens outside the window via stacked layers. KV cache per sliding layer is O(W × layers_local) rather than O(seq × layers). <SourceNote tier="primary">Jiang et al., "Mistral 7B," arXiv:2310.06825.</SourceNote> Modern mixed-attention designs alternate local and global: Gemma 2 interleaves local (W=4096) and global layers; GPT-OSS 120B's config specifies a mix of `sliding_attention` (W=128) and `full_attention` layers. The design trades off global-context fidelity for a major KV reduction. <SourceNote tier="primary">Gemma 2 tech report, arXiv:2408.00118; GPT-OSS 120B config.json on HuggingFace.</SourceNote>
+- **Attention sinks / streaming attention** (Xiao et al., ICLR 2024) exploit the observation that the first few tokens of a sequence get outsized attention regardless of content — keeping those "sinks" and evicting middle tokens preserves generation quality far better than naïve windowing. <SourceNote tier="primary">Xiao, Tian, Chen, Han, Lewis, "Efficient Streaming Language Models with Attention Sinks," arXiv:2309.17453.</SourceNote> Integrated in TensorRT-LLM and HuggingFace Transformers; vLLM declined to implement ("not planned" per their issue tracker). Whether frontier-lab production stacks use streaming-style eviction is not publicly disclosed.
+
+PagedAttention works for the same reason DRAM controllers prefer reads from already-open rows, the same reason SSDs use super-pages striped across chips, and the same reason hard drives need defragmenting: at every layer of the memory hierarchy, the cost of an access is dominated by getting to the data, not reading it. Software that arranges related data spatially — same DRAM row, same flash page, same disk track — pays the move once and amortizes it across many reads. Most of what looks like architectural diversity below the application layer is one principle in different geometry. <SourceNote tier="derived">Synthesis. Open-row reuse and HDD defragmentation: Hollick, "How is data stored?" (Making Software, 2026). PagedAttention and SSD super-page parallels are the post's own framing.</SourceNote>
+
+### Mixture of Experts — sparse activation and why it benchmarks differently
+
+Every frontier model released since mid-2024 is a Mixture of Experts. DeepSeek V3 (December 2024) has 671B total parameters but only 37B activate on any given token. Llama 4 Maverick (April 2025) has 400B total / 17B active across 128 routed experts plus 1 shared expert. GPT-OSS 120B (OpenAI's open release) has ~117B total / 5.1B active across 128 experts. Qwen3-235B-A22B — the naming convention "A22B" = 22B activated — has 22B active over 128 experts. Only Anthropic hasn't confirmed Opus's architecture either way. <SourceNote tier="primary">DeepSeek-V3 technical report (arXiv:2412.19437); Meta Llama 4 blog (April 5, 2025); OpenAI GPT-OSS model card; Qwen3 blog. Claude Opus architecture has not been publicly disclosed.</SourceNote>
+
+The mechanics: each transformer layer replaces its single feedforward MLP with N parallel experts plus a small router network. For every token, the router scores all experts, picks top-K, and only those K experts do the forward pass. DeepSeek-V3 uses top-8 of 256 routed experts plus 1 shared expert (9 total active per token). Llama 4 Maverick uses top-1 of 128 routed plus 1 shared (2 total). GPT-OSS 120B uses top-4. The Mixture of Experts Layer goes back to Shazeer et al. 2017 ("Outrageously Large Neural Networks," arXiv:1701.06538); Switch Transformer (Fedus, Zoph, Shazeer 2021, arXiv:2101.03961) simplified it to top-1 routing; Mixtral 8x7B (arXiv:2401.04088) brought the pattern to the open-weight frontier with top-2 of 8. <SourceNote tier="primary">Shazeer et al. 2017; Fedus et al. 2021; Jiang et al. 2024.</SourceNote>
+
+**The asymmetry is the whole point and the whole problem.** HBM capacity cost scales with total parameters — every expert has to be resident somewhere in the inference fleet because routing decisions are per-token and unpredictable. Compute cost scales with active parameters — only the K selected experts run per token. So a 671B DeepSeek V3 holds ~1.3 TB of weights in HBM at BF16 but does roughly the FLOP count of a 37B dense model per forward pass. This is great for tokens-per-second-per-watt and terrible for single-box deployability.
+
+**How experts actually get served: expert parallelism.** You can't fit 256 experts on one GPU, so each GPU holds a subset of experts and every decode step involves an **all-to-all** communication — each token's router output tells the system which GPU has the expert it needs, and activations get shuffled across the pool. This is why NVL72 matters disproportionately for MoE: 72 GPUs inside a single NVLink domain mean the all-to-all traffic stays on 1.8 TB/s NVLink rather than crossing 400 Gbps InfiniBand. SGLang's large-scale EP deployment (12 nodes × 8 H100 = 96 H100s) serving DeepSeek-R1 reports **52.3K input tokens/sec and 22.3K output tokens/sec per node** on 2,000-token prompts — a per-8-GPU-node figure, not a per-GPU figure. NVIDIA's own wide-EP benchmarks on GB300 NVL72 show SGLang on DeepSeek-R1 up to ~25× the H200 throughput at matched latency. <SourceNote tier="primary">LMSYS / SGLang, "Deploying DeepSeek R1 with PD Disaggregation and Large-Scale Expert Parallelism" (lmsys.org/blog, May 5, 2025). NVIDIA "Scaling Large MoE Models with Wide Expert Parallelism on NVL72" developer blog. LMSYS GB300 NVL72 InferenceX benchmark (Feb 20, 2026).</SourceNote>
+
+**This is where the "~100× H100" InferenceMAX numbers come from.** The headline wins SemiAnalysis publishes — Blackwell/Rubin-class racks multiplying H100 throughput on specific benchmarks — are mostly MoE scenarios where NVL72 scale-up lets the all-to-all stay inside copper. For dense non-MoE models (Llama-3 70B, Qwen 72B), the generational uplift on the same benchmark collapses to a much smaller range. When a vendor reports a headline ratio, the first question to ask is: *which model, which interactivity point, which precision, MoE or dense?* <SourceNote tier="analyst">SemiAnalysis InferenceMAX v2 dashboard. The specific "100× at a single interactivity point" number requires reading the published scenario (inferencemax.semianalysis.com); the underlying sensitivity to model type is why one number can't summarize the benchmark.</SourceNote>
+
+**Two downstream consequences worth noting.** First, the embedding math from the previous section looks different on MoE: when the active body is 5.1B params (GPT-OSS 120B) and the vocab is 201,088, the `lm_head` projection becomes a larger fraction of per-step decode compute than in a dense 70B — not 2%, closer to double-digit percentages depending on shape. Second, DeepSeek's auxiliary-loss-free load balancing (a bias-adjusted routing score rather than a training-time balance penalty) is the current state-of-the-art for keeping experts evenly loaded at inference time; expert "hot spots" where one expert gets disproportionate traffic have been the standard production headache. <SourceNote tier="primary">DeepSeek-V3 technical report on auxiliary-loss-free balancing. lm_head fraction is my own math from the published config and decode FLOP formula — profile your own workload to verify the exact percentage.</SourceNote>
+
+The investment-relevant collapse of this section: **MoE is why hardware benchmarks require unpacking, why NVLink scale-up matters more than raw FLOPs, and why HBM capacity — not just bandwidth — is one of the binding constraints.**
+
+### The serving stack — why tokens got cheaper
+
+A large fraction of the token-price decline over the last three years is software, not silicon. The load-bearing techniques:
+
+- **Continuous batching / iteration-level scheduling (Orca, OSDI '22).** The scheduling granularity is one decode step, not one request — every iteration, new requests admit into free batch slots, finished requests evict immediately, and prefill for newcomers interleaves with decode for everyone else. The non-trivial engineering is *selective batching*: attention has to be per-request (each holds its own KV), but MLP matmuls cross-request batch because they're all multiplying the same weight matrix by different activations. Orca reported 36.9× throughput at matched p50 latency versus pipeline-parallel FasterTransformer on GPT-3 175B. <SourceNote tier="primary">Yu et al., OSDI '22.</SourceNote>
+- **PagedAttention (vLLM, SOSP '23).** KV cache as OS virtual memory — chunked into fixed-size blocks (16 tokens typical, ~80 KB each on Llama-70B), each request holds a block table mapping logical positions to physical blocks, sequences grow by grabbing from a global pool, shared prefixes point to the same physical blocks with refcounts and copy-on-write. External fragmentation goes to zero by construction. The vLLM paper reports KV waste falling from 60–80% to under 4% and 2–4× throughput over prior systems on realistic traces. The attention kernel has to do a block-table lookup per K/V read — FlashAttention-3 and FlashInfer now ship native paged-KV support with `<5%` overhead vs contiguous. <SourceNote tier="primary">Kwon et al., SOSP '23 / arXiv:2309.06180.</SourceNote>
+- **Speculative decoding.** A cheap draft model proposes k candidate tokens; the target model verifies them in one parallel forward pass (essentially the same cost as one decode step, because decode is bandwidth-bound). Expected speedup is `(1 − α^(k+1))/(1 − α)` where α is per-token acceptance rate — k=5, α=0.7 gives ~2.4×. Costs HBM (draft weights + parallel KV) and falls apart above ~batch 32 when the target's decode stops being bandwidth-bound. EAGLE-3 (NeurIPS '25) sidesteps the memory cost by reusing the target's own intermediate features; it's become the production default in stacks that ship spec-decoding. <SourceNote tier="primary">Leviathan et al. 2023; Chen et al. 2023; EAGLE-3 (arXiv:2503.01840).</SourceNote>
+- **Disaggregated serving** (DistServe, Splitwise, Mooncake). Run prefill and decode on separate pools; ship KV cache between them. The two SLAs this optimizes: **TTFT (time to first token)** — how long the user waits before streaming starts, dominated by prefill — and **TPOT (time per output token)** — the inter-token cadence the user experiences, dominated by decode. Chat SLAs want both small simultaneously; colocating prefill and decode on the same GPU pool forces a compromise. A 2K-token Llama-70B prefill produces ~620 MB of cache that has to move to the decode GPU — roughly 12 ms on 400 Gbps RDMA, mostly hidden behind the first decode step; roughly 50 ms on 100 Gbps, which does hurt TTFT. This is the concrete mechanism linking inference architecture to optical-networking demand, not just "bigger cluster more fiber." DistServe reports 2–3.4× goodput on chat and code-completion workloads, where **goodput** = throughput meeting both TTFT and TPOT SLAs, not raw tokens/sec. <SourceNote tier="primary">DistServe (arXiv:2401.09670); Mooncake (arXiv:2407.00079).</SourceNote>
+- **FP4 on Blackwell.** Dropping from FP16 to FP4 halves the bytes per weight twice over, directly buying throughput on a memory-bound workload. The "up to 100×" InferenceMAX number is true but narrow: it's specifically DeepSeek-R1 MoE on GB300 NVL72 at 116 tok/s/user interactivity, against a best-configured H100 FP8 disagg baseline. Decomposed roughly: ~2× from FP8→FP4, ~3–4× from H100→B200 generational uplift, ~3× from 72-GPU NVLink scale-up letting MoE all-to-all stay off InfiniBand, ~2× from MTP, plus superlinear scaling once the whole model fits in one NVLink domain. For dense non-MoE models (Llama-3 70B, Qwen2-72B), the gen-over-gen win collapses to ~3–5×. "100×" is a specific-benchmark claim, not a generic uplift. <SourceNote tier="analyst">SemiAnalysis InferenceMAX v2 dashboard and launch post. Vendor-agnostic methodology, but SA-published. Decomposition is the arithmetic implied by the published scenario.</SourceNote>
+
+These headline numbers don't stack multiplicatively — Orca's 36.9× is against FasterTransformer's static-batching baseline; vLLM's 23× is against HuggingFace TGI v0.9 that already had basic continuous batching. But the cumulative effect is visible in actual pricing across three years, and it's the cleanest evidence that efficiency is a real phenomenon, not a narrative.
+
+**The quality-adjusted price curve** is the single most rigorously documented number in this space:
+
+- **Stanford HAI's 2025 AI Index** (Chapter 1) reports that the inference cost for GPT-3.5-level quality fell from $20 per million tokens (November 2022) to $0.07 per million tokens (October 2024, via Gemini 1.5 Flash-8B) — a **~280× drop in 18 months**. <SourceNote tier="primary">Stanford HAI, AI Index Report 2025, Chapter 1 (Research & Development), hai.stanford.edu/ai-index/2025-ai-index-report.</SourceNote>
+- **Epoch AI's underlying dataset** (the source Stanford draws from) characterizes the full deflation curve as "prices have fallen by between 9× and 900× per year depending on the performance milestone" — the wide range reflects that commoditizing an existing capability is much cheaper than extending the frontier. <SourceNote tier="primary">Epoch AI, "LLM Inference Price Trends," epoch.ai/data-insights/llm-inference-price-trends.</SourceNote>
+- **a16z's "LLMflation" post** (Guido Appenzeller, November 2024) frames the same curve as "10× per year for 3 years, 1,000× cumulative" for GPT-3-quality output going from $60/M (2021) to $0.06/M (2024). <SourceNote tier="primary">a16z, "Welcome to LLMflation," a16z.com/llmflation-llm-inference-cost.</SourceNote>
+
+**Frontier model sticker prices tell a different story** — they've held remarkably flat:
+
+- **Claude Sonnet** has been $3 input / $15 output per million tokens since Claude 3 Sonnet launched March 2024 — through Sonnet 3.5, Sonnet 4, Sonnet 4.5, and Sonnet 4.6, a span of roughly 25 months with no headline price cut. <SourceNote tier="primary">Anthropic pricing page; launch dates verified across Anthropic press releases.</SourceNote>
+- **Claude Opus** dropped from $15 / $75 (Opus 3, March 2024) to $5 / $25 (Opus 4 through 4.7 in 2025–April 2026) — a 67% cut at both ends. A subtlety flagged by trade-press analysis: Opus 4.7 shipped with a new tokenizer that can emit up to 35% more tokens for the same text, so "unchanged $/M" does not equal "unchanged $/request." <SourceNote tier="primary">Anthropic pricing; Finout tokenizer-change analysis of Opus 4.7.</SourceNote>
+- **OpenAI o3** launched April 2025 at $10 input / $40 output, then dropped **80%** in mid-2025 to $2 / $8 — the steepest single cut in the o-series. GPT-5.4 sits around $2.50 input / $15 output per aggregator tracking. <SourceNote tier="primary">OpenAI Developer Community announcement of the o3 price cut; Artificial Analysis model index for GPT-5.4.</SourceNote>
+- **DeepSeek R1** anchors the floor at $0.55 input / $2.19 output — roughly 27× cheaper than o1's launch pricing by arithmetic, though only ~3–4× against the reduced o3. DeepSeek's off-peak 75% discount ran from February to September 2025 before being ended. <SourceNote tier="primary">DeepSeek API pricing docs; SCMP, Bloomberg coverage of the off-peak discount and its end.</SourceNote>
+- **Sam Altman** has publicly stated (February 2025) that *"the cost to use a given level of AI falls about 10× every 12 months"* and that price-per-token fell ~150× from GPT-4 (early 2023) to GPT-4o (mid-2024). A vendor framing, but it matches the independent data. <SourceNote tier="speaker">Altman public statements, Feb 2025. Vendor framing; cross-check with Epoch AI / Stanford HAI numbers above.</SourceNote>
+
+**The open-source tier is where the floor-breaking happens most aggressively.** DeepInfra lists Llama 3.3 70B output at $0.15–$0.36/M as of April 2026, down from ~$0.88 in late 2024 across Together/Fireworks — roughly 5–6× at the commodity floor in 18 months. <SourceNote tier="analyst">Artificial Analysis provider tracking for Llama 3.3 70B.</SourceNote>
+
+**The pattern:** quality-adjusted price for any given capability tier falls ~10× per year. Frontier list prices at the top of the stack held flat for Sonnet (25 months at $3/$15), cut ~67% for Opus over two years, and cut 80% for o-series reasoning on a single step. The efficiency is real; list prices hold because demand keeps absorbing it. That's the Jevons dynamic in one paragraph.
+
+---
+
+## The demand side — five multipliers, one compounding curve
+
+The 2023 version of inference was a single ChatGPT turn consuming on the order of a thousand tokens. The 2026 version is an agent. Five independent multipliers now stack on top of every task:
+
+<FiveMultipliers />
+
+### Reasoning tokens — the multiplier that justifies everything else
+
+The top multiplier deserves its own walk-through because it's the demand shock that turned inference from a chat workload into a compute-intensive one.
+
+Before September 2024, when you sent a prompt to an LLM, the model produced a response directly. No hidden computation. The output tokens you paid for were the tokens you saw. Then OpenAI announced o1-preview on September 12, 2024, and the o1 blog post made an explicit claim that reframed the whole economics: *"o1 consistently improves with more reinforcement learning (train-time compute) and with more time spent thinking (test-time compute)."* <SourceNote tier="primary">OpenAI, "Learning to reason with LLMs" (Sept 12, 2024). This is the post that introduced the "scaling inference-time compute" framing.</SourceNote>
+
+Thinking in this sense is literal. The model generates a long internal reasoning chain — hidden from the user but counted against your token budget and billed at output rates. OpenAI's reasoning documentation states explicitly that reasoning tokens "are not visible via the API… they still occupy space in the model's context window and are billed as output tokens," and recommends reserving at least 25,000 tokens of headroom for reasoning plus outputs. <SourceNote tier="primary">OpenAI reasoning guide, platform.openai.com/docs/guides/reasoning.</SourceNote> Per the same guide, a simple query burns a few hundred reasoning tokens; a complex planning task burns "tens of thousands."
+
+The pricing tells the rest. At o1's December 5, 2024 API launch: $15 / $60 per million tokens for input / output. Gemini 2.5 Flash makes the split visible in real time — the same model bills output at $0.60/M with thinking off and **$3.50/M with thinking on**, a ~6× step from one flag, with a configurable `thinkingBudget` from 0 to 24,576 tokens per turn. <SourceNote tier="primary">OpenAI o1 pricing; Google Gemini thinking docs, ai.google.dev/gemini-api/docs/thinking.</SourceNote> DeepSeek R1 (January 20, 2025, arXiv:2501.12948) was the cost-side answer: $0.55 input / $2.19 output per million tokens, with `reasoning_content` returned in an explicit `<think>` tag — the first major open-weight reasoning model. At launch that's roughly 27× cheaper input and 27× cheaper output than o1 by arithmetic, though OpenAI's mid-2025 o3 price cut to $2 / $8 narrowed the gap substantially. <SourceNote tier="primary">DeepSeek R1 paper (arXiv:2501.12948); DeepSeek API pricing; OpenAI o3 pricing notice at community.openai.com.</SourceNote>
+
+**The benchmark that made this concrete: ARC-AGI.** In December 2024, ARC Prize reported OpenAI o3 achieving 75.7% at low-compute settings and 87.5% at high-compute settings — at a reported ~$20/task and ~$3,000/task respectively, with the high-compute run using 172× more tokens than the low. In April 2025, ARC Prize and Toby Ord revised the cost estimates upward by roughly 10×, to **~$200/task low-compute and ~$30,000/task high-compute**. o3-high was subsequently dropped from the ARC Prize main chart because it exceeded the $10,000/task eligibility cap. <SourceNote tier="primary">ARC Prize, "OpenAI o3 Breakthrough High Score on ARC-AGI-Pub" (Dec 20, 2024); ARC Prize April 2025 revision; Toby Ord's April 2025 analysis. Cite both sets of numbers, not one — the revision is part of the story.</SourceNote> A single hard reasoning task can burn billions of tokens of hidden thinking.
+
+**METR measured the trajectory.** Their March 2025 paper introduced a metric — "50% time horizon," the length of task (measured in human-minutes) an AI completes with 50% success rate — and found it doubling roughly every 7 months from 2019 to 2025 across 11 frontier models. The January 2026 update ("Time Horizon 1.1") revised the post-2023 regime to **130.8 days — about 4.3 months**, with the task suite expanded from 170 to 228 tasks and 8-hour-plus tasks doubled from 14 to 31. <SourceNote tier="primary">METR, "Measuring AI Ability to Complete Long Tasks" (arXiv:2503.14499, March 2025); METR "Time Horizon 1.1" (January 29, 2026).</SourceNote> Horizon is roughly proportional to tokens per task — so task-level compute demand is doubling every ~4 months *just from horizon extension*, before any growth in users or sessions.
+
+**Why this matters for hardware.** Reasoning models don't produce more input tokens; they produce vastly more output tokens. Output-heavy workloads are decode-dominated, and decode is memory-bandwidth-bound — which means a reasoning-heavy inference mix shifts demand *hard* toward parts with high HBM bandwidth per dollar. The conventional wisdom that "reasoning = decode-bound" is widely repeated in inference-economics commentary but not rigorously quantified in any peer-reviewed source I can cite; frame it as directional. <SourceNote tier="derived">Directionally true from the decode-bound-ness established earlier and from measured output-token volumes, but I could not find a published production-telemetry study that proves an I/O inversion. Treat as an analyst intuition, not a measurement.</SourceNote> The direct economic evidence is cleaner: Claude Opus 4.7 launched April 16, 2026 at $5/$25 (down from Opus 3's $15/$75) and GPT-5.4 lists around $2.50/$15 — reasoning-tier prices are falling *and* reasoning-tier token consumption per task is rising. The compounding is why inference is on track to dominate training compute within this decade.
+
+The single most-quoted total-demand figure comes from Jensen Huang's GTC 2026 keynote: **~10,000× per-workload growth × ~100× usage = ~1,000,000× total AI compute demand in two years**. This is a vendor CEO speaking at his own product event; treat the exact numbers as Nvidia's framing, not a neutral measurement. <SourceNote tier="speaker">Jensen Huang, Nvidia GTC 2026 keynote (March 2026). Vendor presentation; verify via the keynote video / transcript.</SourceNote>
+
+The multipliers are real and several are company-published:
+
+- **Reasoning models invert the I/O ratio.** Gemini 2.5 Flash exposes a "thinking budget" that, when enabled, moves output pricing from $0.60/M → $3.50/M — a material price step from a single flag. <SourceNote tier="primary">Google Developers pricing page.</SourceNote>
+- **ARC-AGI-1 on o3-high** was reported at roughly $3,000 per task in the initial ARC Prize breakdown, later revised upward by independent compute analyses. Estimates above $20K/task for o3-high have circulated; the exact number depends on revised compute counting. <SourceNote tier="analyst">ARC Prize blog (Dec 2024); Toby Ord and TechCrunch revised estimates (April 2025).</SourceNote>
+- **Anthropic's own multi-agent system** uses roughly 15× the tokens of chat, with token count explaining ~80% of BrowseComp performance variance. <SourceNote tier="primary">Anthropic engineering, "How we built our multi-agent research system" (June 2025).</SourceNote>
+- **MCP tool definitions** run ~280–320 tokens each; a rack of five MCP servers with ~50 tools consumes 30–60K tokens before any user prompt. <SourceNote tier="analyst">Third-party MCP token counters (mrphilgames.com, mcpplaygroundonline.com, lunar.dev). Cursor's 40-MCP-tool cap and Copilot's 128-tool cap are vendor-documented.</SourceNote>
+- **Long-horizon runtime**: Anthropic's Claude Sonnet 4.5 launch post documented a ~30-hour continuous autonomous coding run producing ~11,000 lines of code in a single session. <SourceNote tier="primary">Anthropic, "Introducing Claude Sonnet 4.5" (Sept 2025).</SourceNote>
+
+Efficiency has not kept up. Over the same period:
+
+- Anthropic's reported ARR has grown rapidly. End of 2025: ~$9B. March 2026 (Dylan on Dwarkesh): ~$20B. April 2026 (Dylan on Invest Like The Best): ~$35–40B with an asserted ~$10B of incremental monthly ARR. The $20B+ trajectory is corroborated by multiple trade outlets; the specific monthly-add figure is analyst assertion only. <SourceNote tier="speaker">Dylan Patel on Dwarkesh (March 13, 2026) and Invest Like The Best (April 23, 2026). ARR growth widely reported in secondary press (The Information, Sacra, SaaStr) but Anthropic has not published ARR directly.</SourceNote>
+- **OpenAI API throughput**: 6+ billion tokens per minute, per Sam Altman at DevDay 2025 — roughly 8.6 trillion tokens per day. <SourceNote tier="primary">Sam Altman, OpenAI DevDay (Oct 2025).</SourceNote>
+- **Claude Code adoption**: SemiAnalysis reports ~9.7% of daily GitHub commits contain Claude Code signatures as of March 2026, targeting 20% by EOY. SA publishes this in their free research; the methodology is theirs. <SourceNote tier="analyst">SemiAnalysis, Great GPU Shortage dashboard (March 2026).</SourceNote>
+- **H100 one-year rental contract price** rose from ~$1.70/hr (Oct 2025) to ~$2.35/hr (March 2026) per SemiAnalysis's rental tracker. <SourceNote tier="analyst">SemiAnalysis GPU Rental Price Tracker (subscription). Free dashboard previews support the 40% figure.</SourceNote>
+
+Patel frames this with what he calls the Parkinson dynamic: each HBM capacity and bandwidth bump gets absorbed by designers expanding parameter counts, context lengths, and KV-cache footprints. Every efficiency win becomes next year's baseline. <SourceNote tier="speaker">Patel framing; consistent with observed 2022–2026 pattern across PagedAttention, FP4, MLA, prompt caching.</SourceNote> The broader economics history literature calls this Jevons' paradox. <SourceNote tier="primary">Jevons, *The Coal Question* (1865). a16z's LLMflation applies the frame to inference.</SourceNote>
+
+Jevons is a regularity, not a law. It holds when three conditions stack: demand elasticity > 1 (cheaper means *more* total spend, not less), capability keeps compounding with compute (METR's task-horizon metric currently doubles every ~4 months), and the latent-use-case reservoir stays large (developer coding is maybe 5% saturated and is one of 20+ knowledge-work verticals). All three are intact right now — tokens got ~280× cheaper while aggregate spending rose ~100,000×, an implied log-log elasticity near 3. The dynamic breaks if horizon-doubling stalls past 12 months, if capex-to-ARR ratios invert, or if an efficiency gain large enough to outrun downstream capital accumulation ships all at once. All three are measurable; all three are on the catalyst list below.
+
+---
+
+## The Hamming forecast — three equations, three graphs
+
+I've been reading Hamming's *The Art of Doing Science and Engineering* alongside this research, and his method is the right discipline to apply here. Hamming on forecasting:
+
+> *"In forming your plan for your future you need to distinguish three different questions: What is possible? What is likely to happen? What is desirable to have happen?"* — Ch. 1
+>
+> *"We do not need to know what will happen — we just need to be ready when it does."*
+>
+> *"Great scientists and engineers do back-of-the-envelope calculations far more often than ordinary scientists."*
+
+The point isn't precision — it's a model that updates fast when reality bends the curve. State the simplest equation, anchor on one disclosed number, project forward at one doubling rate, and be explicit about what assumption breaks the projection. Three BOTECs are enough to bound the AI compute thesis. The full sandbox lives in [`/botec`](https://github.com/JakeLee13/JakeLee13.github.io/tree/main/botec) — playable Python, editable parameters, regenerable plots. The summary versions:
+
+### BOTEC #1 — Token demand compounds through three independent factors
+
+The simplest equation that captures the dynamic is a product of three exponentials: **`T(t) = U(t) · τ(t) · m(t)`** — where U is active LLM users globally, τ is tokens per user per day, and m is the agentic multiplier (fraction of users on agentic workflows × per-task multiplier). All three doubled in the past 12–18 months. The April 2026 anchor is roughly 100 trillion tokens/day across the major labs — back-derived from OpenAI's 6 B tok/min DevDay disclosure plus Anthropic's 15 B tok/min plus Gemini's 10 B tok/min, plus the long tail. <SourceNote tier="primary">OpenAI DevDay (Oct 6, 2025); Anthropic April 2026 disclosure; Pichai Q4 2025 earnings.</SourceNote>
+
+<BlogImage src="/images/botec/01_token_demand.png" alt="Token demand compounding model" caption="BOTEC 1 — T(t) = U·τ·m. Central case: ~6×/yr aggregate token growth (~32× in 2 yr). S-curve override flattens around the user-saturation ceiling. The 2030 sensitivity to doubling-time choices spans three orders of magnitude — which tells you the central forecast is uncertain, not that the direction is wrong." />
+
+If U doubles every 12 months (slowing as ChatGPT WAU saturates the addressable internet), τ every 12 months (Claude Code adoption), m every 18 months (multi-agent maturity), the product compounds at **~6× per year** — which is the geometric mean of three independent exponentials and matches the empirically observed 5–10× annual API throughput growth.
+
+What breaks it: user saturation past ~5 B (4× headcount ceiling); per-user cognitive ceiling around ~10 M tokens/day for agentic workflows; or political backlash throttling deployable GW per year. The interesting thing about Hamming-style BOTECs is that *every* one of these breaks is measurable — you'll see it before the curve actually bends.
+
+### BOTEC #2 — The supply ceiling is set by ASML, with a 2026–2028 gap
+
+Two equations, one collision:
+
+- **`GW_ceiling(t) = N_tools(t) / 3.5 · f_AI`** — Patel's "3.5 EUV tools per GW Rubin" applied to ASML's published shipment cadence, with `f_AI` the fraction of EUV allocation going to AI silicon.
+- **`GW_built(t) = capex(t) · s_inference / $12B-per-GW-built`** — converts hyperscaler capex into deployed AI fleet, where `s_inference` ≈ 55% is the inference share.
+
+The two curves cross around 2026 and the gap widens through 2030.
+
+<BlogImage src="/images/botec/02_gw_supply.png" alt="GW supply vs demand model" caption="BOTEC 2 — left: ASML's annual EUV shipments and the cumulative installed base. Right: the AI-allocated GW ceiling (blue band, varying f_AI from 40–75%) against the fleet built from hyperscaler capex (green) and from lab inference revenue alone (red). Capex outruns the AI-allocated ceiling around 2026 and the gap reaches ~2× by 2030. That gap *is* the bottleneck rotation." />
+
+Anchors: ASML guides ~70 EUV tools shipped in 2026 ramping toward ~100/yr by 2030, cumulative ~700 by 2030. <SourceNote tier="primary">ASML investor materials; the per-year cadence is Patel extrapolation but consistent with ASML guidance.</SourceNote> Hyperscaler capex is $200 B (2024) → $400 B (2025) → $600 B (2026), with ~55% inference share. <SourceNote tier="primary">Big-4 hyperscaler capex guidance; inference-share split is SemiAnalysis framing.</SourceNote> At $12 B per GW built (land + power + GPUs + networking + real estate), $600 B of 2026 capex implies ~70 GW added that year — already pressing against the EUV-allocated ceiling. **By 2028 the implied build is ~150 GW against a ceiling of ~95 GW. That ~60% gap is the margin-rotation thesis quantified.**
+
+The "what's *desirable*" question lives here too. 100 GW of US AI inference is roughly 10% of the US grid. Engineering-feasible; permitting-uncertain. Patel's April 2026 backlash prediction is a desirability constraint that could bind before the physical one does.
+
+### BOTEC #3 — The deflation hides a Jevons collapse
+
+The cleanest BOTEC for what investors get wrong. Three nested equations:
+
+- **`C_token(t) = C_0 · exp(-k·t)`**, with a hardware/energy floor around **$0.001 per million tokens**
+- **`T_task(t) = T_0 · 2^(t/τ_H)`**, with an S-curve cap at **~10 million tokens per task**
+- **`$/task(t) = C_token(t) · T_task(t) / 10^6`**
+
+Per-token cost falls. Per-task tokens rise. The product can be flat or rising — even when sticker prices crater.
+
+<BlogImage src="/images/botec/03_cost_per_capability.png" alt="Cost per capability model" caption="BOTEC 3 — top-left: $/M-tok at GPT-3.5 quality drops 20,000× by 2030, hitting an energy/silicon floor around $0.001/M. Top-right: frontier sticker price drifts *up* slowly (Sonnet flat 25 mo; Mythos at 5–10× Opus). Bottom-left: tokens-per-task follows METR's 4.3-month doubling, capped at 10M. Bottom-right (the punchline): $/task at the frontier *rises ~2,000×* by 2030 even while the unit token cost falls 100×. That is the Jevons paradox in one chart." />
+
+The Stanford HAI AI Index pegs GPT-3.5-quality inference at **$20/M tokens (Nov 2022) → $0.07/M (Oct 2024) — 280× in 23 months.** <SourceNote tier="primary">Stanford HAI 2025 AI Index, Ch. 1.</SourceNote> Long-run rate per Epoch AI is ~50×/yr median, with a hardware/energy floor around $0.001/M tokens (raw electricity + amortized silicon). <SourceNote tier="primary">Epoch AI inference price trends.</SourceNote> METR's task-horizon doubling at 4.3 months <SourceNote tier="primary">METR Time Horizon 1.1, Jan 2026.</SourceNote> says tokens-per-task scales aggressively until the practical agent ceiling (~10 M tokens for a multi-day workflow) saturates.
+
+The product is the bill. **Per-token cost falls 20,000× by 2030; per-task cost at the frontier rises ~2,000×.** That's the math behind "headline prices crater while AWS bills explode," and it's the cleanest single-chart explanation for why Anthropic ARR went from $4 B to $40 B in 18 months while Sonnet stayed at $3/$15 the whole time.
+
+### What this method gets right — and what it can't
+
+Hamming on the limits of forecasting from his own field's history (Ch. 28, Experts):
+
+> *"If an expert says something can be done he is probably correct, but if he says it is impossible then consider getting another opinion."*
+>
+> *"The predictions made by almost all the experts 10, 20, 30 years ago have not been realized."*
+
+The BOTECs above can't tell you the 2030 number. They can tell you which *assumptions* you're making, which *measurable signals* would break the projection, and which *direction* the constraint is rotating. That's the apparatus. Hamming's load-bearing forecast was the 1960 prediction that half of Bell Labs' budget would eventually go to computing — colleagues thought he was crazy; he was too low. The analogous bet here is that aggregate AI inference compute will compound at 5–10×/yr through 2028, that the EUV tool fleet binds it from 2028 onward, and that frontier $/task will rise even as $/token collapses. Each is testable on a quarterly cadence. The full apparatus — equations, plots, parameters — is in [`/botec`](https://github.com/JakeLee13/JakeLee13.github.io/tree/main/botec).
+
+---
+
+## The lab math — this isn't projection, it's arithmetic
+
+Patel's framing on Dwarkesh converts lab revenue into capacity using a rule-of-thumb conversion rate. His stated number: **~$10 billion per gigawatt per year** of rental-equivalent compute spend. <SourceNote tier="speaker">Patel, Dwarkesh (March 13, 2026). Back-of-envelope conversion; not an audited figure.</SourceNote> Against that:
+
+- **Anthropic current fleet:** roughly 2.0–2.5 GW, targeting 5–6 GW by EOY 2026 across own capacity plus Bedrock/Vertex/Foundry, and roughly 10 GW by EOY 2027. <SourceNote tier="speaker">Patel, Dwarkesh (March 2026). Secondary reporting (Reuters, The Information) corroborates "multi-gigawatt" scale but not the specific numbers.</SourceNote>
+- **OpenAI end-of-2026:** roughly 6 GW on the same analyst framework; EOY 2027 ~10 GW. <SourceNote tier="speaker">Patel, Dwarkesh (March 2026).</SourceNote>
+- **Global AI deployed today:** ~20 GW per the Dwarkesh framing. <SourceNote tier="speaker">Patel, Dwarkesh (March 2026).</SourceNote>
+
+Even discounting each of these by 30% for analyst framing, the *direction* is unambiguous: just the two top frontier labs will want 30+ GW by end of 2027, against a roughly 20 GW global AI fleet today. Other model providers (Google, xAI, Meta) and sovereign AI buildouts (G42, HUMAIN, IndiaAI, Scaleway, Nscale, Mistral) stack on top. Google's Gemini-related ARR in Q4 2025 was described by Patel as going from near-zero to ~$5B in a single quarter; Google has not independently disclosed a comparable number. <SourceNote tier="speaker">Patel, Dwarkesh. Google's overall cloud AI revenue is reported; the Gemini-specific $5B is Patel's figure.</SourceNote>
+
+Patel's cleanest investable frame is what he calls the **X − 1 problem**: frontier labs plan capacity for the demand they model (X), while each layer of the supply chain plans conservatively (X − 1 or even X ÷ 2). The gap between what labs want and what suppliers are building is where margin accrues at the binding layer. <SourceNote tier="speaker">Patel, Dwarkesh.</SourceNote>
+
+### Six-week update — Patel on Invest Like The Best (April 23, 2026)
+
+Six weeks after Dwarkesh, Patel updated several figures on Patrick O'Shaughnessy's show. I'm tagging every one of these as `Speaker claim` because none are independently sourced. They are still worth tracking — a single tightly-positioned analyst updating his own numbers in the bullish direction every six weeks is itself a signal — but the reader should not treat them as fact.
+
+<SourceNote tier="speaker">All figures in this section: Dylan Patel on *Invest Like The Best*, April 23, 2026. Patel publishes the underlying data (cluster tracking, fab tracking, TCO models) behind the SemiAnalysis subscription paywall; the podcast exposes his assertions but not the underlying spreadsheets. Secondary reporting corroborates ARR direction but not the specific figures.</SourceNote>
+
+- **Anthropic ARR:** described as ~$35–40B, headed to $40–45B; **monthly incremental ARR ~$10B**. Up from $4–6B/month framing in the March episode.
+- **Anthropic gross margin:** stated as a *floor* of ~72%, derived by Patel from the assumption that all of Anthropic's incremental compute went to inference. If some went to R&D (which Mythos and Opus 4.7 suggest is true), the actual inference GM is lower. Patel's opening anchor was a ~35% figure from a leaked early-2026 Anthropic funding doc. <SourceNote tier="derived">Patel's 72% is an upper bound given his stated assumption, not a primary disclosure. The 35% funding-doc leak was reported by The Information.</SourceNote>
+- **Hopper useful life:** described as 7–8 years based on observed re-signings of 3–4-year-old H100 and A100 clusters. Economic life, not semiconductor life.
+- **Mythos:** described by Patel as Anthropic's next-frontier model, internally available since February 2026, not publicly released as of April 23, and deployed selectively (notably to cybersecurity customers). Token cost described as 5–10× Opus 4.7. None of this is verifiable without Anthropic confirming; Anthropic has neither confirmed nor denied publicly as of this writing.
+- **Model "hoarding"** — Patel's predicted trajectory of narrowing frontier-model distribution to high-value enterprise customers. This is a prediction, not an observation.
+- **CPUs sold out** — Patel's assertion that (1) RL environments and (2) serving agent-generated code are creating a new CPU demand leg. Consistent with hyperscaler capex guidance rising but not independently quantified in this episode.
+- **TSMC 2028 capex ~$100B** — Patel's own forecast, up from TSMC's 2026 guided ~$57B. TSMC has not issued 2028 capex guidance.
+- **"All tier labs sold out of tokens"** — Patel's framing of demand exceeding supply even at the tier-2 and tier-3 model level. Not independently confirmed; consistent with API availability reports but not rigorous.
+- **Public-backlash prediction: large-scale protests within 3 months** — Patel's explicit forecast. The specific Sam Altman home-incident claims ("Molotov twice in two weeks") are unverified against credible security reporting and should be treated as hearsay until confirmed.
+- **Phantom GDP** — a framework Patel attributes to his own team's economist. Useful as a mental model but no external academic literature yet.
+
+The pattern is unambiguous: a well-positioned analyst is revising his own numbers in one direction only. But "well-positioned" is not the same as "audited." Six weeks from now we will have more data.
 
 ---
 
@@ -68,43 +277,59 @@ My Claude Code workflow is one of four fundamentally different ways organization
 
 <ConsumptionModes />
 
-**Direct consumer products** — Claude.ai, ChatGPT — are the simplest path. You type, the model responds. The request goes over the public internet to the provider's GPU cluster and back. No tools, no orchestration, just chat.
+**Direct consumer products** — Claude.ai, ChatGPT — are the simplest path. You type, the model responds.
 
-**Agentic developer tools** — Claude Code, Codex — add the tool-use loop I described above. The LLM inference still happens in the cloud, but the tools execute locally. The model orchestrates your development environment remotely while reasoning on GPU hardware that might be 2,000 miles away.
+**Agentic developer tools** — Claude Code, Codex, Cursor — add the tool-use loop. The LLM still runs in the cloud; tools execute locally.
 
-**Enterprise backend APIs** — AWS Bedrock, Google Vertex — are how products like Stripe or Ramp embed AI behind their features. The request never hits the public internet. It flows through a VPC (Virtual Private Cloud) from the application server to the inference endpoint, all within AWS or GCP infrastructure. The end customer using Stripe's fraud detection or Ramp's expense categorization has no idea an LLM is involved.
+**Enterprise backend APIs** — AWS Bedrock, Google Vertex, Azure OpenAI — are how products like Stripe and Ramp embed AI behind features. Requests flow through a VPC from app server to inference endpoint, never hitting the public internet.
 
-**Internal productivity agents** are the most interesting category. Ramp built an agent called Inspect that writes ~30% of their merged pull requests. Engineers @mention it in Slack. It spins up a full sandboxed development environment on Modal — pre-cached with 30-minute filesystem snapshots so dependencies are always fresh. The agent clones the repo, writes code, runs tests, and pushes a PR. Same underlying LLM inference as me chatting with Claude.ai, but wrapped in a full CI/CD pipeline with database access, feature flags, and monitoring.
+**Internal productivity agents** are the most interesting category. Ramp built an agent called Inspect that reportedly writes a material share of their merged PRs (InfoQ, Jan 2026 reported ~30%). <SourceNote tier="primary">InfoQ interview with Ramp engineering (Jan 2026).</SourceNote> Engineers invoke it in Slack; it spins up a sandboxed dev environment on Modal, clones the repo, writes code, runs tests, and pushes a PR.
 
-The investment insight: **all four modes create demand for the same scarce physical resources** — GPU hours, HBM bandwidth, optical networking, fab capacity, EUV tools. The consumption surface area is expanding in every direction simultaneously. Consumer chat was just the beginning.
+All four modes create demand for the same scarce physical resources — GPU hours, HBM bandwidth, optical networking, CoWoS capacity, EUV passes. **The consumption surface is expanding in every direction simultaneously.**
+
+---
+
+## What about robots and voice?
+
+Two questions every reader has at this point: doesn't the humanoid wave (Optimus, Figure, 1X) and the LLM-voice transition (Siri, Alexa+, ChatGPT Voice) compound on top of all this? Yes — but the bytes go to different places than the intuition suggests, and that matters for which layers in this stack catch the demand.
+
+**Robotics inference is overwhelmingly *onboard*, not in the datacenter.** The four constraints — closed-loop control latency (10–100 ms), battery power, no-Wi-Fi reliability, and per-query OPEX at fleet scale — force System-1 motor control onto edge silicon, and 2026's production VLAs put System-2 reasoning there too. Figure's Helix runs ~7B + 80M onboard on embedded GPUs. NVIDIA's GR00T N1.7 targets Jetson AGX Thor (128 GB **LPDDR5X**, not HBM). Tesla AI5 carries up to 192 GB LPDDR5X for Optimus + FSD. A million Optimus units does not equal a million more H100s — it equals a million Tesla AI5 chips fabbed at TSMC + Samsung and a lot more **LPDDR**, which competes with HBM for the same big-3 wafer pool rather than directly extending HBM demand. <SourceNote tier="primary">NVIDIA Jetson Thor product page; TrendForce on Tesla AI5 / SK Hynix / Samsung LPDDR5X allocation (April 2026); Figure Helix architecture post.</SourceNote>
+
+The HBM tailwind from robotics lives on the *training* side. Tesla's Cortex 2.0 ramps to 500 MW of NVIDIA GPUs through mid-2026; NVIDIA's published GR00T-N1-2B pretraining ran ~50K H100-hours per generation; Cosmos world-model training is comparable to frontier video-gen. Real, recurring, HBM-consuming — but it scales with R&D intensity and frontier model size, not 1:1 with deployed-robot count. A fleet of one million humanoids running the same shipped checkpoint adds ~zero training compute per unit. <SourceNote tier="primary">DCD on Tesla Cortex; NVIDIA GR00T N1 paper (arXiv:2503.14734); NVIDIA Cosmos developer blog.</SourceNote>
+
+Voice splits three ways, and only two of them route to the original beneficiary stack. **Alexa+** runs Anthropic Claude on >1M Trainium2 chips at AWS via Project Rainier — real cloud LLM demand, but it routes through Anthropic + Marvell + TSMC, not NVIDIA. **ChatGPT Realtime** is the cleanest extension of the original thesis: native audio-to-audio at ~16 audio tokens/sec/user, **5–10× the per-minute token volume of text chat**, on a 900M-WAU base — directly NVIDIA/HBM/Azure-positive and growing fast. **Apple Intelligence** routes most queries to a 3B on-device model and escalates to **Private Cloud Compute on Apple-Silicon servers** (M5 Ultra, Houston) — a real net-new datacenter footprint, but on Apple's unified-LPDDR architecture, not NVIDIA HBM. So Apple is a TSMC-N3P/N2 tailwind and an HBM-neutral story; the ChatGPT-fallback path inside Siri is the only piece that touches the original thesis directly. <SourceNote tier="primary">Anthropic + AWS Project Rainier disclosures; Anthropic-Amazon $100B / 5 GW commitment (Anthropic, 2025); OpenAI gpt-realtime pricing; Apple ML Research on PCC architecture; 9to5Mac on the M5 Ultra PCC transition (Feb 2026).</SourceNote>
+
+The cleanest 10× extension of the five-multiplier compounding model into a new modality isn't robots — it's **always-on background voice agents**: a Personal-Context Siri or Anthropic-Computer-Use Alexa that runs persistently rather than reactively, reproducing the same reasoning + tool-use + multi-agent + MCP-context + long-horizon stack on a billion phones. No assistant ships this at scale yet. Apple's iOS 27 (September 2026) is the live catalyst to watch; Alexa+ feature expansion is the secondary one. The robotics version of the same catalyst — VLAs scaling past 100B parameters and being forced to cloud System 2 — is plausibly 2027–2028. **Until either ships, treat embodied AI as a TSMC + LPDDR + training-amortized HBM story, not a per-unit datacenter inference story.** <SourceNote tier="derived">Synthesis from `knowledge/perspectives/compute-trades/embodied-inference-thesis.md`. Watch items: Apple iOS 27 launch; Alexa+ persistent-feature rollout; first humanoid OEM disclosing cloud-routed System-2 in production.</SourceNote>
 
 ---
 
 ## The thesis
 
-This boils down to one thing: **margin flows to whoever controls the tightest bottleneck.** And that bottleneck is shifting — from power (2024–25) to logic and memory (2026–27) to EUV lithography (2028+). The goal isn't to chase where the constraint is today. It's to be positioned where it's *moving to*.
+Every layer of the AI supply chain has a different lead time. As each shorter-lead-time problem gets solved, the constraint rotates down to whatever takes longer to scale. **Margin flows to whoever owns the layer that cannot be scaled on demand-signal timelines.**
 
 Here are the numbers that matter right now:
 
 <ComputeInsightCards />
 
-These aren't speculative projections. Hyperscaler capex is committed capital. TSMC's capacity shortfall is from their own chairman. H100 spot prices are real deals being signed. And ASML's production ceiling is physics.
+These are a mix of primary-disclosed and analyst-derived figures. Hyperscaler capex is committed capital (earnings disclosures). Published H100 rental prices come from SemiAnalysis's tracker. ASML's tool-production cadence is public per their disclosures, but the implied "200 GW ceiling" embeds analyst assumptions about how many tools you need per gigawatt.
 
-### The bottleneck keeps moving
+### The bottleneck keeps moving — and that's the investment thesis
 
 <BottleneckTimeline />
 
-Each layer of the AI supply chain has a different lead time. Data centers: 8–12 months. Power: 1–2 years. Fabs: 2–3 years. EUV tools: 3–5 years. As the shorter-lead-time problems get solved — and power and data centers *are* being built rapidly — the constraint cascades down to whatever takes longest to scale.
+The timeline isn't just describing what's scarce. It's describing **where margin flows over time**, and a serious investor rotates positions with it.
 
-Per Dylan Patel at SemiAnalysis: there's no more capacity to slide from mobile and PC to AI. Nvidia is already the largest customer at both TSMC and SK Hynix. The consumer-to-AI shift is fully tapped out. From here, scaling means building *new* fab capacity, and that's gated by ASML's ability to produce EUV tools.
+<RotationTable />
+
+The key move is matching *position duration* to *bottleneck timing*. Neoclouds and power plays are 2026 duration. Memory and foundry are 2026–28. **ASML is the longest-hold position precisely because the constraint binds last.** Its 2030 fleet ceiling is physics — ASML's disclosed EUV shipment cadence implies a cumulative fleet on the order of several hundred tools by 2030. The "3.5 tools per GW of Rubin" figure used to derive an implied 200-GW-per-year ceiling is Patel's own AI Accelerator Model output; the input (tool shipment cadence) is primary, the conversion is analyst. <SourceNote tier="derived">ASML shipment cadence is primary (ASML FY disclosures); tools-per-GW conversion is SemiAnalysis's.</SourceNote>
+
+Per Patel, the consumer-to-AI capacity shift in the semiconductor supply chain is now tapped out: Nvidia is the largest customer at both TSMC and SK Hynix. From here, scaling means *new* fab capacity rather than reallocating existing lines — which makes ASML's cadence the effective ceiling. <SourceNote tier="speaker">Patel, Dwarkesh (March 2026). Directionally corroborated by TSMC / SK Hynix customer disclosures but framing is Patel's.</SourceNote>
 
 ---
 
 # Following the hardware down
 
-We've traced the software path — from token to tool call and back. Now let's trace the physical path. What is the GPU cluster that processed my request? What does it look like? How does data move through it? And what had to be manufactured, packaged, and shipped to make it exist?
-
-Each section goes one layer deeper into the supply chain.
+We've traced the software path — prefill to decode to tool loop and back. Now let's trace the physical path.
 
 ---
 
@@ -112,323 +337,302 @@ Each section goes one layer deeper into the supply chain.
 
 ### What an AI data center actually looks like
 
-A modern AI training cluster is one of the most power-dense, thermally challenging, and networking-intensive structures humans build. Understanding the physical reality helps explain why companies like CoreWeave can build billion-dollar businesses and why optical networking stocks matter.
+**Power density.** A traditional enterprise rack draws 5–10 kW. An AI GPU rack draws 40–100+ kW. An Nvidia DGX GB200 NVL72 cabinet (72 Blackwell GPUs in a single liquid-cooled rack) draws ~120 kW. <SourceNote tier="primary">Nvidia GB200 NVL72 spec.</SourceNote>
 
-**Power density.** A traditional enterprise data center rack draws 5–10 kW. An AI GPU rack draws 40–100+ kW. An Nvidia DGX GB200 NVL72 cabinet (72 Blackwell GPUs in a single liquid-cooled rack) draws ~120 kW. This 10–20x increase in power density changes everything about data center design.
+**Cooling.** Air cooling fails above ~30 kW per rack. AI data centers require direct liquid cooling. Nvidia's GB200 NVL72 is liquid-cooled by design. <SourceNote tier="primary">Nvidia GB200 product pages.</SourceNote>
 
-**Cooling.** Air cooling, which worked fine for decades of enterprise computing, fails above ~30 kW per rack. The heat simply can't be removed fast enough through air circulation. AI data centers require direct liquid cooling (DLC) — cold plates bolted directly to GPUs and CPUs, with liquid loops carrying heat to building-level heat exchangers. Some facilities use immersion cooling, submerging entire servers in dielectric fluid. Nvidia's Blackwell systems require liquid cooling by design — there's no air-cooled option.
-
-**Scale.** A single large training cluster might contain 16,000–100,000+ GPUs. Meta's next-generation training cluster reportedly targets 600,000+ GPUs. At 700W per GPU (Blackwell), a 100K GPU cluster draws 70 MW just from the GPUs — before networking, storage, cooling overhead, and power conversion losses. Total facility power for such a cluster approaches 100–150 MW.
+**Scale.** Meta's announced Prometheus and Hyperion clusters target several-hundred-thousand GPU scale for next-generation training. At 700W per Blackwell, a 100K cluster draws 70 MW from GPUs alone; total facility power approaches 100–150 MW. <SourceNote tier="primary">Meta AI infra disclosures; Nvidia power specs.</SourceNote>
 
 <DataCenterDiagram />
 
 ### The networking hierarchy
 
-In a large AI cluster, the network is as important as the GPUs. Training large models requires constant communication between GPUs — exchanging gradients during training, synchronizing activations during pipeline-parallel inference. If the network can't keep up, GPUs sit idle waiting for data.
+**Intra-node: NVLink.** Within a cabinet, Nvidia's NVLink 5.0 connects GPUs at 1.8 TB/s bidirectional. NVSwitch chips act as crossbar switches. <SourceNote tier="primary">Nvidia NVLink 5.0 spec.</SourceNote>
 
-**GPU-to-GPU (intra-node): NVLink.** Within a single server or cabinet, Nvidia's NVLink connects GPUs at 1.8 TB/s (NVLink 5.0, Blackwell). NVSwitch chips act as crossbar switches connecting all GPUs within a node. This is the fastest link in the hierarchy and uses on-board copper traces — short distances, massive bandwidth.
+**Intra-cluster: InfiniBand.** Between servers, InfiniBand runs 400–800 Gbps per port. Nvidia acquired Mellanox in 2020 for $6.9B specifically for InfiniBand. <SourceNote tier="primary">Nvidia / Mellanox merger press release, 2020. Headline price $6.9B (often rounded to $7B).</SourceNote>
 
-**Node-to-node (intra-cluster): InfiniBand.** Between servers in a cluster, InfiniBand provides 400–800 Gbps per port using copper direct-attach cables (DAC) for short distances (1–5m) or active optical cables for longer runs. Nvidia acquired Mellanox in 2020 for $7B specifically for InfiniBand — they understood that owning the network was as important as owning the GPU.
+**Rack-to-rack and beyond: optical.** Beyond ~5 meters, copper can't hold signal. Active optical cables convert electrical to light via VCSEL or edge-emitting lasers, through fiber, back to electrical.
 
-**Rack-to-rack and beyond: Optical networking.** As distance increases beyond ~5 meters, copper can't maintain the signal. Active optical cables use laser transmitters (typically VCSEL-based for short-reach, or edge-emitting lasers for longer distances) to convert electrical signals to light, send them through fiber, and convert back. A spine switch connecting racks might handle 51.2 Tbps aggregate bandwidth.
+**Between clusters: coherent optics.** For campus or metro-scale, coherent transceivers use DSP and advanced modulation to push 400–800 Gbps per fiber pair. <SourceNote tier="primary">Standard optical-networking engineering; see Cignal AI and LightCounting market coverage.</SourceNote>
 
-**Between clusters and data centers: Coherent optics.** For distances beyond ~100 meters — connecting buildings within a campus, or data centers across a metro area — coherent optical transceivers become necessary. These devices use sophisticated digital signal processing (DSP) and advanced modulation formats (like DP-16QAM) to squeeze 400–800 Gbps through a single fiber pair. For intercontinental links, Dense Wavelength Division Multiplexing (DWDM) stacks dozens of wavelengths onto a single fiber, achieving terabits of aggregate bandwidth.
-
-**Why optical networking is a bottleneck.** Every GPU added to a cluster requires proportionally more networking. But the relationship isn't linear — it's superlinear. A cluster of N GPUs doing all-reduce communication generates O(N) network traffic. But the number of potential point-to-point paths scales O(N²). Network architects use clever topologies (fat-tree, dragonfly, rail-optimized) to manage this, but the fundamental scaling challenge means optical networking demand grows faster than GPU demand.
-
-This is why Coherent Corp and Lumentum matter. They make the optical transceivers, laser sources, and photonic components that enable data movement at scale. Situational Awareness LP holds Lumentum as their 4th-largest position ($479M) and Coherent as their 11th ($89M). The signal is clear: as clusters scale from thousands to hundreds of thousands of GPUs, optical networking becomes a binding constraint.
+**Why optical is a bottleneck.** Cluster all-reduce generates O(N) traffic, but potential paths scale O(N²). Network architects use dragonfly and rail-optimized topologies to manage it, but optical demand grows superlinearly with cluster size. Patel described optical transceivers on Dwarkesh as "more unreliable than the GPUs" — replugged across cluster lifetime, effectively consumables. <SourceNote tier="speaker">Patel, Dwarkesh (March 2026). Reliability framing is his; the superlinear-scaling math is standard.</SourceNote> Coherent and Lumentum make the parts; Situational Awareness LP's reported 13F shows Lumentum and Coherent as top-10 positions. <SourceNote tier="primary">Situational Awareness LP 13F (most recent public filing).</SourceNote>
 
 ### The neocloud business model
 
-A "neocloud" is a cloud provider built specifically for GPU workloads — CoreWeave, Lambda Labs, Together AI, and others. The business model is straightforward: acquire GPUs (often before they're available on the open market through early Nvidia relationships), build optimized GPU data centers, and rent compute to AI companies at premium prices.
+A "neocloud" is a cloud provider built specifically for GPU workloads — CoreWeave, Lambda, Together, Crusoe, Nebius. Acquire GPUs, build optimized data centers, rent to AI labs.
 
-**Why it works right now:** H100 deals are signing at $2.40/hr for 2–3 year contracts. The total cost of ownership to build and operate a Hopper cluster is about $1.40/hr across a five-year life. That's 70%+ gross margin. In a supply-constrained market where labs will pay almost anything for compute, the neocloud model prints money.
+**The economics Patel describes on Dwarkesh:** H100 build-cost TCO around $1.40/hr amortized over five years, with some 2–3-year rental contracts signing at ~$2.40/hr with AI labs. That implies ~70% gross margin on hardware roughly two years into its five-year life. Both the build cost and the rental rate come from SemiAnalysis's paywalled AI Cloud TCO Model; we're trusting their aggregation. <SourceNote tier="analyst">SemiAnalysis AI Cloud TCO Model (subscription). Directional rental trend corroborated by the free Great GPU Shortage dashboard.</SourceNote>
 
-**CoreWeave** went from a crypto mining operation to a $35B+ valuation AI cloud provider in under three years. They IPO'd in March 2025 and have raised billions in debt financing secured by GPU clusters. Their key advantage is operational speed — they can deploy GPU capacity months faster than hyperscalers building from scratch.
+### GPUs that appreciate
 
-**Oracle** is the surprising hyperscaler play. Zuckerberg's deal to use Oracle's cloud for Meta's AI training, combined with Oracle's role as a backend provider for OpenAI, positions them as a major GPU cloud player. Oracle's advantage is their willingness to deploy massive GPU clusters quickly with flexible terms — something AWS, Azure, and GCP are slower to do due to their enormous existing businesses.
+The conventional bear case (associated with Michael Burry's summer 2024 semiconductor short position) says GPUs depreciate as better chips arrive. The counter-argument Patel and SemiAnalysis have articulated: in a supply-constrained market, price is set by value-extractable-today, not by replacement cost. <SourceNote tier="speaker">Patel framing; Burry positioning via Scion Asset Management 13F filings.</SourceNote>
 
-### GPUs that appreciate in value
+The data point that supports the appreciation frame: SA's GPU rental tracker shows H100 1-yr contract pricing rising ~40% between October 2025 and March 2026. If supply were overbuilt, prices would be falling. <SourceNote tier="analyst">SemiAnalysis GPU Rental Price Tracker.</SourceNote>
 
-This is the most counterintuitive part of the whole thesis, from Patel's analysis.
+### Why the crunch favors frontier models
 
-The conventional bear case says GPUs depreciate as better chips arrive. But in a supply-constrained world, the price isn't set by what else you could buy — it's set by **the value you can extract from it today**.
+The tempting frame here is Alchian-Allen: adding a fixed per-unit cost to two goods narrows their ratio and shifts consumption toward the higher-quality variant (the "shipping oranges to New York" argument). It's directionally right but technically loose — the theorem requires the *same absolute* cost added to both goods, which isn't how compute works. Opus burns more HBM per token than Sonnet; when the H100 rental rate rises, Opus's per-token cost rises *more* in absolute terms, not equally. So the clean Alchian-Allen math breaks.
 
-GPT-5.4 runs cheaper per token and produces better output than GPT-4 on the *same hardware*. The TAM for GPT-4 tokens was maybe tens of billions. For GPT-5.4 tokens, it's north of $100B. Same H100, more valuable output. So the GPU is worth more.
-
-### The Alchian-Allen effect
-
-A fun economics concept that applies here. If GPUs get more expensive via a fixed-cost increase, the *ratio* between using the best model versus a mediocre one narrows. If an H100 goes from $2 to $3/hr but Opus produces 1M tokens and Sonnet produces 2M, the effective premium for frontier quality shrinks from 2x to 1.5x. Everyone shifts to the best model.
-
-The compute crunch creates a flywheel. Best model → most revenue → can pay highest prices for scarce compute → locks in more capacity → maintains best model. This is why "all the volumes are on the best models today."
+The cleaner version is demand-side. As tasks shift toward reasoning, agents, and long-horizon runs, the marginal utility of a better model rises disproportionately — the difference between "task completes" and "30-hour job fails at hour 27" isn't linear in quality. Frontier-model price power rises not because Sonnet gets relatively more expensive, but because the workload mix is shifting toward tasks where Opus-level capability is load-bearing, and agent users will pay almost anything to avoid re-running a long job. That's complementary-capital economics (better model × more compute-per-task = exponential quality gains), not shipping costs. <SourceNote tier="primary">Alchian & Allen, *University Economics* (1964). The demand-side reframing is mine; Patel's original framing leans Alchian-Allen.</SourceNote>
 
 ---
 
 ## The GPU — from triangles to tensors
 
-My request was processed by specific hardware — likely an H100 or Blackwell GPU inside one of those liquid-cooled racks. But how did a chip designed to render video game graphics become the engine of the AI revolution?
+My request was processed by specific hardware — likely an H100 or Blackwell inside one of those liquid-cooled racks. But how did a chip designed to render triangles become the engine of the AI revolution?
 
 ### From pixel pushers to tensor engines
 
-**The GPU concept (1990s).** Early 3D graphics cards (Voodoo, TNT, GeForce) were fixed-function pipelines — hardwired circuits that could only do one thing: transform 3D triangles into 2D pixels. Each generation added more fixed-function units (texture mapping, anti-aliasing, pixel shading). The chips were fast at graphics but useless for anything else.
+**The GPU concept (1990s).** Early 3D graphics cards were fixed-function pipelines — hardwired circuits for transforming triangles into pixels.
 
-**Programmable shaders (early 2000s).** The shift to programmable shader processors (starting with DirectX 8/9 era GPUs) was the critical inflection. Instead of fixed circuits, GPUs gained small programmable cores that could execute custom programs on each vertex and pixel. This made GPUs flexible — and researchers noticed that if you could program them, maybe you could use them for non-graphics computation.
+**Programmable shaders (early 2000s).** GPUs gained small programmable cores that could execute custom programs on each vertex and pixel. Researchers noticed these could be repurposed for non-graphics compute.
 
-**GPGPU and CUDA (2006–2007).** Before CUDA, using a GPU for general computation meant disguising your math problem as a graphics operation — encoding data as "textures" and computation as "shader programs." It was an ugly hack. Nvidia's CUDA (Compute Unified Device Architecture), launched with the Tesla architecture in 2006, changed everything. CUDA exposed the GPU's parallel processors through a C-like programming language. For the first time, you could write normal-looking code and run it on thousands of GPU cores simultaneously.
+**GPGPU and CUDA (2006–2007).** Before CUDA, GPU compute meant disguising math as graphics. Nvidia's CUDA, launched with the Tesla architecture in 2006, exposed GPU parallel processors through a C-like language. <SourceNote tier="primary">Nvidia CUDA 1.0 release history.</SourceNote>
 
-This was not inevitable. ATI (later AMD) had comparable hardware but bet on open standards (OpenCL) rather than building a proprietary ecosystem. The difference in execution was massive — CUDA had better tools, better documentation, better libraries, and critically, **better academic adoption**. By the time deep learning exploded in 2012, the CUDA ecosystem was already 6 years deep.
+ATI (later AMD) bet on open standards (OpenCL). CUDA won on tools, documentation, libraries, and academic adoption. By 2012 deep learning the CUDA ecosystem was already six years deep.
 
 ### The AlexNet moment
 
-In September 2012, Alex Krizhevsky, Ilya Sutskever, and Geoffrey Hinton entered the ImageNet Large Scale Visual Recognition Challenge with a deep convolutional neural network trained on two Nvidia GTX 580 GPUs. AlexNet achieved a top-5 error rate of 15.3% — crushing the second-place entry (26.2%) which used hand-crafted features.
-
-This wasn't just an incremental improvement. It was a paradigm shift. The entire field of computer vision pivoted to deep learning overnight. And every researcher who wanted to replicate the result needed Nvidia GPUs and CUDA.
+In September 2012, Alex Krizhevsky, Ilya Sutskever, and Geoffrey Hinton entered ImageNet with a deep CNN trained on two Nvidia GTX 580s. AlexNet achieved a top-5 error rate of 15.3%, versus the second-place entry at 26.2%. <SourceNote tier="primary">Krizhevsky et al., NIPS 2012.</SourceNote> The field pivoted. Every researcher who wanted to replicate needed Nvidia GPUs and CUDA.
 
 ### The architecture generations
 
 <GPUEvolution />
 
-**Volta (2017) was the inflection point.** The V100 introduced Tensor Cores — specialized matrix multiplication units that could do mixed-precision (FP16 × FP16 → FP32) matrix operations at roughly 5× the speed of standard CUDA cores. This was Nvidia explicitly designing hardware for deep learning. The V100 became *the* AI training GPU, and its tensor core design philosophy carries through every subsequent generation.
+**Volta (2017)** introduced Tensor Cores — specialized matrix multiplication units doing mixed-precision matmul at roughly 5× standard CUDA cores. <SourceNote tier="primary">Nvidia Volta whitepaper.</SourceNote>
 
-**Ampere (2020)** added third-generation tensor cores with support for bfloat16, TF32, and structured sparsity (a 2:4 pattern that doubles effective throughput for compatible workloads). MIG (Multi-Instance GPU) allowed partitioning a single A100 into up to seven independent instances — crucial for inference serving where not every job needs a full GPU. The A100 dominated AI training for three years.
+**Ampere (2020)** added third-gen tensor cores with bfloat16, TF32, and 2:4 structured sparsity. MIG (Multi-Instance GPU) partitioned a single A100 into up to seven instances. <SourceNote tier="primary">Nvidia A100 whitepaper.</SourceNote>
 
-**Hopper (2022)** brought the Transformer Engine — hardware that automatically manages FP8 precision during training. FP8 uses 8 bits instead of 16, halving memory usage and doubling throughput for transformer models with minimal accuracy loss. The engine dynamically scales between FP8 and FP16 within each layer based on the statistics of the activations. NVLink 4.0 hit 900 GB/s bidirectional between GPUs. The H100 became "the AI currency" — the unit of account for compute deals.
+**Hopper (2022)** brought the Transformer Engine with automatic FP8 management. NVLink 4 hit 900 GB/s bidirectional. <SourceNote tier="primary">Nvidia H100 whitepaper.</SourceNote>
 
-**Blackwell (2024)** is a two-die design: two GPU dies connected by a 10 TB/s chip-to-chip link on a single module. Second-generation Transformer Engine with FP4 support. NVLink 5.0 at 1.8 TB/s. HBM3E memory. The B200 roughly doubles the training throughput of H100 for large language models and achieves up to 4x improvement in inference throughput (where lower precision matters more).
+**Blackwell (2024)** is a two-die design connected by a 10 TB/s chip-to-chip link. FP4 support. HBM3E. <SourceNote tier="primary">Nvidia Blackwell whitepaper.</SourceNote> SemiAnalysis's InferenceMAX v2 published figures for GB300 NVL72 inference throughput at specific interactivity points — the headline number ("up to ~100× a strong H100 baseline") is their benchmark, at their chosen workload; read the dashboard for the full scenario matrix. <SourceNote tier="analyst">SemiAnalysis InferenceMAX v2 dashboard.</SourceNote>
 
-**Rubin (2026)** will use HBM4 (with the doubled 2048-bit interface), next-generation NVLink, and a new architecture. Jensen Huang has committed to an annual cadence — a new GPU architecture every year, alternating between new designs and optimized refreshes. This is unprecedented in the semiconductor industry, where design cycles traditionally took 2–3 years.
+**Rubin (2026).** HBM4 with doubled 2048-bit interface, next-gen NVLink, and a new architecture. Jensen has publicly committed to annual cadence. <SourceNote tier="primary">Nvidia GTC 2025 / 2026 keynotes.</SourceNote>
 
 ### The CUDA moat
 
-CUDA is more than a programming language. It's an ecosystem:
+CUDA is more than a language. It's cuBLAS, cuDNN, cuFFT, NCCL, TensorRT, Triton, two decades of tooling, and the majority of public ML research.
 
-- **cuBLAS, cuDNN, cuFFT, cuSPARSE** — optimized libraries for every common operation in deep learning
-- **NCCL** — multi-GPU communication library, critical for distributed training
-- **TensorRT** — inference optimization framework
-- **Triton** (Nvidia's, distinct from OpenAI's Triton) — kernel programming framework
-- **CUDA toolkit** — debuggers, profilers, compilers, 20 years of accumulated tooling
-- **Academic papers** — the vast majority of ML research is written, tested, and benchmarked on CUDA
+### Custom silicon: hyperscaler ASICs
 
-AMD's ROCm, Intel's oneAPI, and OpenAI's Triton have all tried to provide alternatives. ROCm has improved significantly — AMD's MI300X is competitive on paper. But "competitive on paper" versus "works at scale in production with minimal engineering effort" is a gap measured in years and billions of dollars of ecosystem investment. Every major ML framework (PyTorch, JAX, TensorFlow) works best on CUDA because that's what the developers use, which means that's what gets optimized, which means that's what developers continue to use. Classic lock-in flywheel.
+**Google TPU** is the most credible alternative. Ironwood (TPU v7) was announced at Google Cloud Next and reached GA in November 2025 — 9,216 chips per ICI superpod, 192 GB HBM per chip, 7.37 TB/s HBM bandwidth, 42.5 ExaFLOPS peak per pod. Google and Anthropic announced on **October 23, 2025** that Anthropic would expand its TPU use to "up to 1 million TPUs" and "well over a gigawatt of compute" online in 2026, framed as "tens of billions of dollars." Subsequent reporting (April 2026) suggests the arrangement expanded to ~3.5 GW with Broadcom as co-designer; those later numbers are trade-press estimates rather than primary disclosures. SemiAnalysis's TCO math — Ironwood ~44% lower per chip versus GB200 on Google's internal cost basis, ~30–41% lower external rental — is their derivation. <SourceNote tier="primary">Anthropic press release (Oct 23, 2025); Google Cloud Press Corner (same date); Google blog on Ironwood (Nov 2025). TCO specifics are SemiAnalysis's derivation, not Google's.</SourceNote>
 
-### Custom silicon: the alternatives
+**AWS Trainium.** Trainium2 went GA December 2024; the Trn2 UltraServer packs 64 chips at 83.2 PFLOPS / 6 TB HBM / 185 TB/s. **Trainium3** launched at re:Invent December 2025 on TSMC 3nm — 2.52 PFLOPS FP8 per chip, 144 GB HBM3e, 4.9 TB/s, 4.4× perf and 4× perf-per-watt over a Trn2 UltraServer. Anthropic's "Project Rainier" deployment runs ~500K Trainium2 chips with AWS publicly projecting >1M by end of 2025. <SourceNote tier="primary">AWS Trn2 GA blog (Dec 2024); AWS Trn3 launch notice (Dec 2025); AWS / Anthropic Project Rainier disclosures.</SourceNote>
 
-Not everyone is content depending on Nvidia:
+**Meta MTIA.** Meta announced a rename and refresh in **March 2026**: the roadmap is now MTIA 300/400/450/500 on roughly a 6-month cadence, not "MTIA v3." MTIA 300 is already in production for ranking and recommendations; MTIA 400 is in lab testing for GenAI inference; MTIA 450/500 are planned. Meta's primary LLM inference serving still runs on Nvidia, with MTIA positioned for ranking/ads today and GenAI inference as a future migration. <SourceNote tier="primary">Meta "Expanding our custom silicon" post (March 2026).</SourceNote>
 
-**Google TPU** has the longest lineage. TPU v1 (2016) was inference-only, designed for the specific matrix operations in Google's production models. TPU v2 (2017) added training capability. By TPU v6 (Trillium, 2024), Google has competitive training hardware — but only for internal use and Google Cloud customers.
+**Broadcom custom ASIC** is the BOM-margin beneficiary behind Google TPU and Meta MTIA — they co-design the silicon and book the silicon revenue. For **full-year FY2025 (ending November 2025)**, Broadcom reported $64B total revenue (+24% YoY) and **$20B of AI semiconductor revenue (+65% YoY)**, with Q4 FY25 AI semi revenue at $6.5B (+74% YoY). Broadcom disclosed five named XPU customers — Google, Meta, OpenAI, Arm/SoftBank, ByteDance — and an AI backlog of ~$73B, including a $10B TPU rack order booked in Q3 and an $11B follow-on in Q4. <SourceNote tier="primary">Broadcom Q4 FY25 press release and earnings call.</SourceNote>
 
-**AWS Trainium/Inferentia** targets the same vertical integration play. Trainium 2 (2024) is designed for large-scale training clusters. Amazon's advantage is packaging Trainium into SageMaker so developers never have to think about the hardware.
+### Inference-specialist silicon — the challengers to HBM-centric GPUs
 
-**Broadcom's custom ASIC business** quietly designs custom AI accelerators for hyperscalers (reportedly Google, Meta, and others). Their revenue from AI-related custom silicon has been growing rapidly. This is the "behind-the-scenes" player that doesn't get headlines but captures significant value.
+A separate class of silicon argues that inference should be its own category, not a subset of training hardware. The thesis: decode is so bandwidth-bound that eliminating HBM entirely in favor of on-die SRAM buys a step-change in tokens/second per user.
 
-The investment lens: Nvidia at 14% allocation reflects the belief that the CUDA moat holds for the foreseeable future, but isn't unassailable. Broadcom at 7% is a hedge — if custom silicon gains share, Broadcom benefits. The key question is whether CUDA's ecosystem advantage is permanent (like Windows in the 1990s) or temporary (like Blackberry before the iPhone). Most evidence points toward durable dominance for at least this investment horizon.
+**Groq (LPU).** Language Processing Unit, SRAM-only architecture — 230 MB on-die SRAM (SRAM is 6 transistors per bit, ~25–50× less bit-dense than DRAM at the same node, which is why 230 MB and not 230 GB), ~80 TB/s on-die bandwidth, 188 TFLOPS FP16 / 750 TOPS INT8 per chip, with deterministic compilation (the compiler knows every memory move ahead of time). <SourceNote tier="primary">Groq LPU explainer and product brief.</SourceNote> On Llama-3 70B in 2024 Groq held the public tokens/sec record. By April 2026 the leaderboard has shifted: Artificial Analysis measures Groq at ~276 tok/s on Llama-3.3 70B, with Cerebras and SambaNova now ahead. <SourceNote tier="analyst">Artificial Analysis provider pages.</SourceNote> **NVIDIA and Groq announced a $20B arrangement in late December 2025** — structurally an asset purchase plus non-exclusive IP license plus Jonathan Ross moving to NVIDIA, with Simon Edwards becoming Groq CEO. Groq continues to operate independently. Secondary reporting framed this as "NVIDIA acquires Groq" but the documented deal is closer to acqui-hire plus IP cross-license than a full acquisition. <SourceNote tier="primary">Groq / NVIDIA licensing press release; CNBC coverage; NextPlatform post-mortem.</SourceNote>
+
+**Cerebras.** WSE-3 is wafer-scale — 900,000 cores, 44 GB on-wafer SRAM, 21 PB/s memory bandwidth, 4 trillion transistors on TSMC 5nm. Published throughput numbers: Llama-3.1 405B at 969 tok/s; Llama-4 Scout at ~2,600 tok/s; Llama-4 Maverick >2,500 tok/s — third-party corroborated by Artificial Analysis. <SourceNote tier="primary">Cerebras WSE-3 press release, Hot Chips 2024 deck, Cerebras Llama-405B benchmark.</SourceNote> **The OpenAI partnership**: announced January 2026 at $10B for 750 MW through 2028; expanded in April 2026 to >$20B with OpenAI receiving equity warrants and a $1B cash commitment toward data-center build. Cerebras refiled its S-1 publicly on **April 17, 2026** targeting Nasdaq ticker CBRS at a reported >$30B valuation; the IPO had been delayed since September 2024 over CFIUS review of G42's stake. <SourceNote tier="primary">OpenAI/Cerebras partnership page; Bloomberg (Jan 2026); The Information (April 2026); Cerebras S-1.</SourceNote>
+
+**SambaNova.** Reconfigurable dataflow with a three-tier memory hierarchy (on-chip SRAM + HBM + DDR), not pure SRAM. SN40L chip, primary customers in sovereign AI and regulated enterprise. Artificial Analysis measures Llama-4 Scout at ~697 tok/s and Llama-4 Maverick at ~655 tok/s. Still private; no recent primary valuation disclosure. <SourceNote tier="primary">SN40L paper (arXiv:2405.07518); SambaNova Llama-4 launch page; Artificial Analysis provider benchmarks.</SourceNote>
+
+**Etched, Tenstorrent — flagged as pre-production.** Etched's Sohu transformer-ASIC was announced June 2024 with "1 server replaces 160 H100s" marketing; as of April 2026 no customer shipments, no independent benchmarks, no production deployments. Treat the headline numbers as marketing until corroborated. Tenstorrent (Jim Keller, CEO) ships Wormhole and Blackhole cards for order — Blackhole p150 was downgraded from 140 to 120 Tensix cores via firmware in early 2026. $3.2B valuation on the last round; design wins with LG, Hyundai, Samsung. <SourceNote tier="primary">Tom's Hardware on Sohu claims; Tenstorrent product pages and firmware-downgrade reporting.</SourceNote>
+
+**AMD.** MI300X (192 GB HBM3, 5.3 TB/s) shipped to Microsoft Azure, Meta, and Oracle for production workloads. MI325X slipped its intended H200-timed launch and was largely skipped for B200 — SemiAnalysis attributed it to soft demand and reduced HBM. MI350X / MI355X (CDNA4, TSMC N3P, 288 GB HBM3E, 8 TB/s, native FP4/FP6) launched at AMD's Advancing AI event in June 2025 with H2 2025 ramp; the 1.4 kW TDP figure refers to the liquid-cooled MI355X specifically. The real moat gap, per SemiAnalysis's 2024–2025 inference reports: ROCm CI coverage has run at under 10% of NVIDIA's, with meaningful accuracy regressions catching users only because outside observers (SemiAnalysis) published them. Named hyperscaler production adoption remains thin relative to marketing. <SourceNote tier="primary">AMD MI300X and MI350 product pages. ROCm coverage gap: SemiAnalysis "AMD vs NVIDIA Inference Benchmark" piece.</SourceNote>
+
+**NVIDIA Dynamo** is NVIDIA's answer — an open-source (Apache-2.0) disaggregated-serving framework announced at GTC March 2025. Dynamo sits *above* inference engines (TensorRT-LLM, vLLM, SGLang, PyTorch are all supported backends), handling KV-cache routing, smart request routing, and async GPU data transfer. This is the counter-move against SGLang and vLLM becoming the default layer: NVIDIA wants the orchestration layer too, not just the hardware. <SourceNote tier="primary">NVIDIA Dynamo press release and developer blog; ai-dynamo/dynamo on GitHub.</SourceNote>
+
+**Investment takeaway.** Nvidia holds the CUDA moat durably for this horizon but isn't unassailable. Three hedges matter: Broadcom as the "if hyperscaler ASICs scale" play (booking TPU/MTIA silicon revenue today); Cerebras and the specialist-silicon complex as the "if inference decouples from training hardware" play (OpenAI's >$20B commitment is the single cleanest external validation); AMD as the "if ROCm catches up" lottery ticket. The specialist challengers don't threaten training workloads — they threaten the inference decode pool specifically, which is the pool growing fastest and which is where Nvidia's HBM-centric margin has been highest.
 
 ---
 
 ## The memory — where my KV cache lives
 
-Remember the KV cache from the inference walkthrough? Those tens of gigabytes of cached attention state live in HBM — High Bandwidth Memory — soldered right next to the GPU die. This is the layer that's quietly becoming just as binding as the GPU itself.
+Those tens of GB of cached attention state live in HBM — High Bandwidth Memory — soldered right next to the GPU die.
 
 ### Why memory is the hidden bottleneck
 
-A modern AI accelerator does one thing overwhelmingly: **move data**. The arithmetic is fast — a Blackwell GPU can do 20 petaFLOPS of FP4 computation. But those compute units sit idle unless memory can feed them fast enough. The ratio of compute to memory bandwidth is the key metric, and it's been worsening for years. This is the "memory wall" — and it's why HBM has become the most fought-over component in the AI supply chain.
+A modern AI accelerator does one thing overwhelmingly: **move data**. Arithmetic is fast — a Blackwell GPU delivers >20 petaFLOPS of FP4 per Nvidia's spec sheet — but compute units sit idle unless memory feeds them. The compute-to-bandwidth ratio has been worsening for years (the "memory wall"). <SourceNote tier="primary">Hennessy & Patterson, *Computer Architecture* (roofline framing).</SourceNote>
 
-### DRAM fundamentals
+### The three mechanisms underneath
 
-All DRAM works the same way at the basic level: a tiny capacitor stores a charge (1 or 0), and a transistor controls access to that capacitor. The capacitor leaks charge constantly, so every cell must be refreshed thousands of times per second. A single DRAM chip contains billions of these capacitor-transistor pairs arranged in a grid of rows and columns.
-
-Standard DRAM connects to the processor through a relatively narrow bus — DDR5 uses a 64-bit interface per channel. You can add more channels, but each one needs its own set of pins on the package, and pins are physically large and expensive. There's a fundamental limit to how many pins you can fit.
+Three different physical mechanisms span the tiers, and the tradeoff axis is the same one across all of them: trade speed for density and persistence by adopting a less-direct way of holding the bit. **SRAM** (caches and on-die scratchpad) holds each bit in a 6-transistor cross-coupled flip-flop, fast (~1 ns) and refresh-free for as long as power is supplied — the bottleneck on its size is bit-line length, which is why L1 caches are kept tiny on purpose. **DRAM** stores each bit as charge on a single tiny capacitor next to a single access transistor (a "1T1C" cell); the capacitor leaks across the closed transistor, so every cell has to be refreshed every ~64 ms or it loses its bit, and reads are differential — the bit line is pre-charged to 0.5 V and a sense amplifier detects a swing of ±0.05 V to recover the value. **NAND flash** (SSDs) traps electrons inside an 8-nm-thick dielectric well, written in by quantum-tunneling them across the barrier under high voltage; one cell holds 3 bits as one of 8 distinct charge levels (TLC), and the tunneling barrier degrades each time you write, which is the physical source of the SSD endurance limit. HBM is DRAM stacked vertically; on-die SRAM in Groq and Cerebras is the same flip-flop scaled up by a couple orders of magnitude. The physics doesn't change between tiers, just the geometry. <SourceNote tier="primary">Dan Hollick, "How is data stored?", makingsoftware.com (Data and Compression chapter, 2026); standard solid-state references (Sedra/Smith, JEDEC) corroborate the per-bit transistor counts and refresh intervals.</SourceNote>
 
 ### The invention of HBM
 
-HBM was born from a collaboration between AMD and SK Hynix, starting around 2008–2010. AMD's Mike O'Brien and Bryan Black had a problem: their GPUs needed more memory bandwidth than conventional GDDR could provide, and they couldn't add more pins to the package.
-
-The solution was radical: **stack DRAM dies on top of each other and connect them vertically.** Instead of a 64-bit bus going horizontally across a circuit board, HBM uses a 1024-bit bus going vertically through the stack using Through-Silicon Vias (TSVs) — tiny copper-filled holes drilled through each silicon die.
-
-TSVs are made by etching holes ~5–10μm in diameter through the silicon, lining them with insulation, and filling them with copper. Each HBM stack has tens of thousands of TSVs creating simultaneous vertical connections. On top of the TSVs, micro-bumps (~40μm solder balls) connect adjacent dies. The bottom die in each stack is a "logic die" that interfaces with the GPU through the shared silicon interposer.
-
-JEDEC standardized HBM in 2013. SK Hynix produced the first HBM1 chips in 2015, and AMD's Fiji GPU was the first to use them. But it was Nvidia's adoption of HBM2 in the Tesla P100 (Pascal, 2016) that established HBM as the standard for AI accelerators.
+HBM emerged from AMD / SK Hynix collaboration starting around 2008–2010. The solution: **stack DRAM dies vertically**, connected by Through-Silicon Vias. Instead of a narrow horizontal bus, HBM runs a 1024-bit bus vertically. JEDEC standardized HBM in 2013; SK Hynix shipped HBM1 in 2015. Nvidia's adoption in Pascal (P100, 2016) made HBM the AI-accelerator standard. <SourceNote tier="primary">JEDEC HBM standard; AMD and SK Hynix disclosures; Nvidia P100 specs.</SourceNote>
 
 <HBMStackDiagram />
 
 ### The generation leap
 
-Each HBM generation stacks more dies, wider interfaces, and exponentially more bandwidth:
+- **HBM1 (2015):** 4-high stack, 128 GB/s per stack
+- **HBM2 (2016):** 8-high, 256 GB/s
+- **HBM2E (2020):** 8-high, ~460 GB/s
+- **HBM3 (2022):** 12-high, ~819 GB/s
+- **HBM3E (2024):** 12-high, ~1.2 TB/s
+- **HBM4 (2026):** **2048-bit interface**, ~2.5 TB/s per stack
 
-- **HBM1 (2015):** 4-high stack, 128 GB/s. The proof of concept.
-- **HBM2 (2016):** 8-high, 256 GB/s. Used in Nvidia V100.
-- **HBM2E (2020):** 8-high, 460 GB/s. The A100 generation.
-- **HBM3 (2022):** 12-high, 819 GB/s. H100 generation. SK Hynix beat Samsung to market by 6+ months.
-- **HBM3E (2024):** 12-high, 1.2 TB/s. Blackwell generation. SK Hynix again first.
-- **HBM4 (2026):** 16-high stack, 2048-bit interface (doubled from 1024), targeting 1.6+ TB/s. The interface change is fundamental — HBM4 puts the logic die at the *base* of the stack rather than at the bottom of the DRAM stack, enabling tighter integration with the GPU.
+<SourceNote tier="primary">JEDEC standards; SK Hynix, Micron, and Samsung product disclosures. Bank-parallelism mechanism: Hollick, "How is data stored?" (Making Software, 2026) — covers DDR generically; HBM3E's specific structure is 16 channels × 2 pseudo-channels per stack with multiple banks per pseudo-channel.</SourceNote>
 
-### The 4x wafer area problem
+Those are sustained numbers, not theoretical peaks, and the mechanism behind that is bank-level parallelism. Every HBM stack is internally divided into many banks (16 channels × multiple banks per channel on HBM3E) running their refresh cycles independently — a bank in refresh is unreadable for several milliseconds, so without enough independent banks for the controller to always find a non-refreshing one, the aggregate-bandwidth number is fiction.
 
-Here's the math that makes memory a systemic bottleneck: **HBM consumes roughly 4x the DRAM wafer area per gigabyte compared to standard DDR5.** This is because HBM uses looser design rules (the TSVs and keep-out zones around them waste area), lower stack density than the latest DDR designs, and more process steps.
+Patel's direct shoreline comparison on Dwarkesh: a given ~13mm edge on the die gets you ~2.5 TB/s with HBM4 versus 64–128 GB/s with DDR5 — roughly a 20× bandwidth-per-edge gap. The shoreline constraint is a physical-design fact; the comparison is Patel's. <SourceNote tier="derived">HBM4 and DDR5 bandwidths are primary; shoreline comparison is Patel's framing.</SourceNote>
 
-HBM's share of total DRAM output is climbing rapidly — from ~5% in 2023 to ~23% projected for 2026. This directly crowds out consumer memory production. Micron exited its Crucial consumer brand entirely. SK Group's chairman warned that the conventional memory shortage could last 4–5 years.
+### The wafer-area problem
 
-A single gigawatt of Rubin-class AI infrastructure requires approximately 170,000 DRAM wafer starts. Memory vendors are doubling or tripling HBM prices while locking in multi-year contracts. Nvidia has $90B in long-term supply contracts and is negotiating three-year deals with memory vendors.
+HBM consumes **~3–4× the DRAM wafer area per gigabyte** compared to standard DDR5 (Tom's Hardware pegs it at ~3×; SemiAnalysis at 3–4× gen-over-gen). Per-die capacity is comparable — a 24Gb HBM3E die is roughly the same bit density as a 24Gb DDR5 die — so the wafer tax is all overhead, and the five factors multiply:
+
+- **Larger die for the same Gb count** (~1.7×) — HBM dies carry TSV landing pads, test structures for stack characterization, and power/signal distribution infrastructure DDR5 doesn't need. 24Gb HBM3E is ~110 mm² vs ~65 mm² for 24Gb DDR5 (SK Hynix data).
+- **Stack yield loss** (~1.5×) — a 12-high HBM3E stack even with pre-binned known-good-dies lands at 50–70% realized yield during ramp vs 85–90% for DDR5 single-die.
+- **TSV keep-out zones** (~1.07×) — each TSV has a ~20µm radial exclusion zone; modern HBM3E has tens of thousands of TSVs per die.
+- **Looser design rules + RDL overhead** (~1.1×) — timing alignment across the stack demands more-conservative layout rules than pure DRAM.
+- **Logic die at stack base** (~1.15×) — every HBM stack has a logic die for the 1024-bit interface, test, and PHY, fabricated on a separate logic process.
+
+Multiplied: ~3.5×, right in the industry range. A fab line optimized for DRAM can print HBM or DDR5 with the same equipment — but shifting capacity HBM-ward reduces total Gb output by 3–4× on the same wafer starts, which is the mechanism behind consumer DRAM price pressure. HBM's share of total DRAM output has risen sharply since 2023 per TrendForce tracking. Micron discontinued its Crucial consumer brand in early 2026. <SourceNote tier="analyst">Tom's Hardware ("HBM is coming for your PC's RAM"); SemiAnalysis "Scaling the Memory Wall"; SK Hynix ISSCC 2024 HBM3E paper; TrendForce (share data); Micron press release.</SourceNote>
+
+Patel's consumer-volume framing — iPhone DRAM cost rising from $50 to $150 per device, smartphone volumes falling from 1.4B toward 500–600M per year — is his forecast. No single primary source confirms all three data points; the directional thesis (HBM crowding out consumer DRAM supply) is corroborated by memory-vendor commentary. <SourceNote tier="speaker">Patel, Dwarkesh. Framing is his; no single corroborating source.</SourceNote>
+
+### The 2026 capex share
+
+Patel's "30% of Big Tech's 2026 capex going to memory" figure is an analyst estimate on hyperscaler capex decomposition. The public hyperscaler capex guidance for 2026 totals ~$600B across the Big-4; the 30%-to-memory apportionment is Patel's. <SourceNote tier="derived">Hyperscaler capex: company earnings guidance. Memory share: Patel's decomposition on Dwarkesh.</SourceNote>
+
+Nvidia's disclosed figure of "$90B+ in long-term supply commitments" has appeared in multiple earnings calls. <SourceNote tier="primary">Nvidia FY'25 10-K and recent earnings commentary.</SourceNote>
 
 ### The CoWoS bottleneck
 
-Even once you have the HBM stacks and the GPU die, you need to put them together. Advanced packaging — specifically TSMC's CoWoS (Chip-on-Wafer-on-Substrate) — has become its own bottleneck.
-
-CoWoS works like this: the GPU die and multiple HBM stacks are placed side-by-side on a large silicon interposer — essentially a thin sheet of silicon with wiring that connects everything. The interposer sits on top of an organic substrate that connects to the outside world. This is how an H100 or B200 module is assembled: one GPU die flanked by HBM stacks, all riding on a shared interposer.
-
-The problem is that the interposer keeps getting bigger as GPUs get larger and require more HBM stacks. The B200 uses a two-die GPU design partly because a single die would require an impossibly large interposer. TSMC has been aggressively expanding CoWoS capacity — from ~15K wafers/month in 2023 to ~40K/month by 2025 — but demand consistently outpaces supply.
+TSMC's CoWoS advanced-packaging technology places GPU die and HBM stacks side-by-side on a large silicon interposer. CoWoS capacity has been tracked by SemiAnalysis, SemiWiki, and Digitimes. The commonly cited progression: ~15K wafers/month in 2023, ~40K by 2025, targeting 90–110K wpm by 2026. Nvidia is reported to have reserved >50% of TSMC's CoWoS allocation for 2026–27. <SourceNote tier="analyst">SemiAnalysis, SemiWiki, Digitimes coverage. TSMC confirms investment in CoWoS capacity but does not publicly break out wafer-per-month guidance.</SourceNote>
 
 ### The competitive landscape
 
-**SK Hynix** dominates HBM. They were first to HBM3, first to HBM3E, and are leading the HBM4 development cycle. Their close relationship with Nvidia (who validates and qualifies each HBM generation) gives them a structural advantage. SK Hynix supplies an estimated 50%+ of all HBM.
+**SK Hynix** is the HBM leader. TrendForce's Q2 2025 HBM share estimate was ~62%. First to HBM3, first to HBM3E, leading HBM4 development. Primary Nvidia memory supplier. <SourceNote tier="analyst">TrendForce citing SemiAnalysis AI Accelerator Model.</SourceNote>
 
-**Samsung** has been playing catch-up. Their HBM3E yields lagged SK Hynix by ~6 months, and Nvidia reportedly rejected early Samsung HBM3E batches due to quality issues. But Samsung is the only company with both DRAM manufacturing *and* advanced foundry capabilities — which could matter for HBM4, where tighter logic-memory integration is required.
+**Samsung** has struggled on HBM3E qualification; yields reportedly lagged SK Hynix by ~6 months. Samsung is the only supplier with both DRAM manufacturing and advanced foundry — potentially material for HBM4's tighter logic-memory integration. <SourceNote tier="analyst">SemiAnalysis Memory Wall piece (Aug 2025).</SourceNote>
 
-**Micron** is the third player, with competitive HBM3E products and strong relationships with the U.S. government (CHIPS Act funding). Their 8-high HBM3E stack uses the least power per bit of the three vendors.
+**Micron** is #3 at ~21% HBM share per TrendForce. Micron has reportedly leapfrogged Samsung on HBM3E via TSV power-delivery innovation. CHIPS Act–funded US capacity. <SourceNote tier="analyst">TrendForce; SemiAnalysis.</SourceNote>
 
-**The investment lens:** The play is SK Hynix (HBM leader), Samsung (tied to the $73B memory investment), Micron, and SanDisk (SA increased their position 816% — that's the signal). Memory is a historically cyclical business that's becoming structurally tight due to HBM's 4x wafer area consumption.
+### The hierarchy isn't anachronism, it's physics-fit
+
+The cache tiers extend below DDR. The frontier-lab inference stack reportedly parks its hour-class KV cache on flash and spinning disk, which sounds anachronistic until you do the physics: an HDD's read/write head flies ~15 nm above a 7,200 rpm magnetic platter (a human hair is 50,000–100,000 nm wide), the magnetic grains hold their polarity for decades with no refresh tax, and mechanical wear in the actuator and spindle bearings is the only failure mode. When the cache tier's drain time is hours, ~10 ms of seek penalty is rounding error against a per-GB cost advantage that flash and DDR can't match. Each tier in the hierarchy is deployed where its physics suits it; HDDs survive in the 2026 inference stack because of that fit, not despite it. <SourceNote tier="primary">HDD physics: Hollick, "How is data stored?" (Making Software, 2026).</SourceNote> <SourceNote tier="speaker">Cache-tier-drain-time framing: Pope on Dwarkesh, April 2026 — the cost of a memory tier equals storage capacity divided by bandwidth, and the optimal cache duration is roughly that drain time.</SourceNote>
 
 ---
 
 ## The foundry — from sand to silicon
 
-That GPU die and those HBM stacks were manufactured somewhere. The "somewhere" is almost certainly TSMC — and the process that created them is one of the most complex manufacturing chains in human history.
+That GPU die and those HBM stacks were manufactured somewhere. The "somewhere" is almost certainly TSMC.
 
 ### How a chip is actually made
 
-A modern processor starts as ordinary sand — silicon dioxide (SiO2). Through a chain of roughly 1,000 process steps spanning 3–4 months, that sand becomes the most complex object humanity manufactures.
+A modern processor starts as silicon dioxide. Through ~1,000 process steps spanning 3–4 months, that sand becomes the most complex object humanity manufactures.
 
-**Step 1: Crystal growth.** Silicon is purified to 99.999999999% purity (eleven nines) through the Siemens process, then melted at 1,414°C. A seed crystal is slowly pulled from the melt using the Czochralski method — rotating at ~1 RPM while pulling upward at ~1mm/min. Over 24+ hours, a single cylindrical crystal (ingot) forms, weighing up to 200kg. This ingot is sliced into wafers 300mm (12 inches) in diameter and polished to atomic smoothness.
+**Step 1: Crystal growth.** Silicon purified to 11-nines via the Siemens process, melted at 1,414°C. A seed crystal is pulled from the melt (Czochralski method). Over 24+ hours a cylindrical ingot up to 200kg forms. Sliced into 300mm wafers polished to atomic smoothness.
 
-**Step 2: The wafer fab.** Each wafer goes through a repeating cycle: deposit a thin film → coat with photoresist → expose with lithography → develop → etch → strip resist → inspect. This cycle repeats dozens of times, building up layer after layer of transistors, interconnects, and metal wiring.
+**Step 2: The wafer fab.** Each wafer cycles through deposit → photoresist → lithography → develop → etch → strip → inspect, dozens of times. Class 1 cleanrooms have fewer than one particle per cubic foot larger than 0.5μm.
 
-The cleanroom itself is extraordinary. Class 1 cleanrooms have fewer than 1 particle per cubic foot larger than 0.5μm. Workers wear full bunny suits. The air is filtered 300–600 times per hour. A single speck of dust on a wafer at the 3nm node would be like a boulder sitting in the middle of a highway — it destroys every circuit it touches.
-
-**Step 3: Back-end processing.** After all layers are built, the wafer is tested (wafer probing), sliced into individual chips (dicing), packaged into their final form, and tested again. Advanced packaging (like CoWoS, discussed in the memory section) is becoming increasingly important and complex.
+**Step 3: Back-end.** Wafer probe → dicing → packaging → final test.
 
 ### The process node naming game
 
-Here's something that confused me until I dug into it: **process node names stopped corresponding to actual transistor dimensions around 2010.**
+Process node names stopped corresponding to physical dimensions around 2010. TSMC's N3 achieves ~290M transistors/mm² per published test-chip density figures. <SourceNote tier="primary">TSMC N3 press materials; IEDM conference disclosures.</SourceNote>
 
-In the early days, "90nm" meant the gate length was literally 90 nanometers. The number tracked a real physical dimension. But starting around the 28nm node, foundries began using node names as marketing labels rather than measurements. Today's "3nm" transistors have gate lengths closer to 12nm, fin pitches around 25–30nm, and metal pitches around 21–24nm.
-
-The actual physical dimensions that matter are: **gate pitch** (spacing between transistor gates), **metal pitch** (spacing between wiring layers), and **transistor density** (transistors per square millimeter). TSMC's N3 achieves ~290M transistors/mm². Intel's competing "Intel 4" achieves ~250M/mm² despite having a nominally larger node name. The numbers on the label are vibes, not measurements.
-
-### Transistor architecture: the real scaling story
-
-The genuine innovations driving performance aren't wavelength reductions alone — they're fundamental changes to transistor geometry.
+### Transistor architecture
 
 <TransistorEvolution />
 
-**Planar MOSFETs (1960s–2011)** worked beautifully for decades. The gate electrode sits on top of a flat silicon channel, controlling current flow. But as dimensions shrank below ~22nm, the gate lost control. The channel became so thin that electrons could tunnel straight through the gate oxide. Leakage current — power consumed even when the transistor is "off" — became untenable.
+**Planar MOSFETs (1960s–2011)** worked until below ~22nm, where gate control broke.
 
-**FinFET (2012–2024)** was the breakthrough. Invented by Chenming Hu at UC Berkeley in 1999, the FinFET raises the channel into a vertical "fin" that the gate wraps around on three sides. This dramatically improves electrostatic control. Intel shipped the first production FinFETs at 22nm (Ivy Bridge, 2012). TSMC followed at 16nm, then 7nm, 5nm, and 3nm — all using variations of the FinFET architecture. The fin width got narrower each generation, the fins got taller, and more fins were packed per transistor. FinFETs dominated for over a decade.
+**FinFET (2012–2024)** raises the channel into a vertical fin the gate wraps on three sides. Invented by Chenming Hu at UC Berkeley in 1999. Intel shipped first at 22nm (Ivy Bridge, 2012). <SourceNote tier="primary">Hu et al. FinFET papers; Intel Ivy Bridge release materials.</SourceNote>
 
-**Gate-All-Around / Nanosheet (2024+)** is the current transition. Instead of a vertical fin, the channel becomes a stack of horizontal nanosheets — thin ribbons of silicon that the gate wraps around on all four sides. Samsung shipped the first production GAA transistors at their 3nm node in 2022 (initially with poor yields). TSMC follows with their N2 process in 2025, and Intel plans GAA for their 20A and 18A nodes.
+**Gate-All-Around / Nanosheet (2024+)** stacks horizontal nanosheets the gate wraps on all four sides. Samsung shipped first at 3nm in 2022 (poor yields initially). TSMC N2 in 2025. <SourceNote tier="primary">Samsung, TSMC press materials.</SourceNote>
 
-The advantage of nanosheets is tunability — you can adjust the width of each sheet to optimize for performance (wider) or power efficiency (narrower), something FinFETs couldn't do. This flexibility matters enormously for AI accelerators that need both high-performance compute and power-efficient inference.
-
-**CFET (~2028+)** is what comes after GAA. Complementary FET stacks an NMOS transistor directly on top of a PMOS transistor — two transistors in the footprint of one. It's still in R&D at IMEC and the major foundries, but it represents the path to continued scaling beyond the limits of single-layer GAA.
+**CFET (~2028+)** stacks NMOS directly on PMOS — two transistors in one footprint. R&D stage. <SourceNote tier="primary">IMEC, TSMC, Intel conference papers.</SourceNote>
 
 ### The foundry landscape
 
-Three companies matter for leading-edge chip manufacturing:
+**TSMC (~67% of pure-play foundry revenue)** is the dominant force. Founded 1987 by Morris Chang. <SourceNote tier="primary">TrendForce market-share data; TSMC history.</SourceNote>
 
-**TSMC (67% market share)** is the dominant force. Founded in 1987 by Morris Chang, who invented the pure-play foundry business model — the idea that a company could specialize in manufacturing chips designed by others, rather than every company building its own fab. This was considered crazy at the time. It turned out to be one of the most important business model innovations in technology history.
+The customer-mix shift matters: Patel's framing on Dwarkesh is that Nvidia is now majority of TSMC N3 by 2027, displacing Apple from its traditional first-customer position; A16 (a 2nm-family node) will have an AI customer, not Apple, as first customer. This is Patel's reading of TSMC's customer allocation; TSMC does not disclose customer mix by node. <SourceNote tier="speaker">Patel, Dwarkesh (March 2026). Corroborated directionally by reports on Nvidia/TSMC allocation but the specific share is his.</SourceNote>
 
-TSMC's moat isn't just one thing. It's the compounding effect of decades of process engineering, a culture of meticulous execution (they call it "learning rate" — how fast yields improve after each node launch), deep customer relationships (Apple, Nvidia, AMD, Qualcomm all depend on TSMC), and massive capital expenditure ($32B+ per year). Their N3E process currently achieves yields above 80% for complex designs — a number that took years of refinement.
+**Samsung Foundry** has been struggling. SF2 yield figures (~40% as of Q1 2026) come from third-party trackers, not Samsung disclosures. Tesla's $16.5B Samsung foundry contract (2024) is public. <SourceNote tier="analyst">Third-party yield trackers (Guru3D, TrendForce). Tesla contract: press release.</SourceNote>
 
-**Samsung Foundry (7.3% market share)** has been struggling. Their 3nm GAA process launched in 2022 with yields reportedly below 20%, causing customer defections. But the picture is changing: their SF2 2nm GAA process has reached 55–60% yields. Tesla signed a $16.5B foundry contract — the largest long-term single-client deal ever. Meta is evaluating Samsung for MTIA accelerators. AMD may use Samsung for EPYC Venice and MI450.
-
-The price difference matters: TSMC's 2nm wafers cost $30K+ while Samsung offers $22–25K. In a supply-constrained world where hyperscalers *must* diversify away from TSMC, Samsung's improving yields and lower prices create a real opportunity. As Ben Thompson argues, the opportunity cost of being chip-constrained at decade's end vastly exceeds whatever it costs to make Samsung viable.
-
-**Intel Foundry** is the wildcard. Bleeding $2.5B per quarter. The 18A node is make-or-break. Intel 18A uses both GAA nanosheets and backside power delivery (running power wires underneath the transistors instead of competing for space with signal wires on top). If yields work by mid-2026, Intel becomes the second viable Western alternative to TSMC. Aschenbrenner held Intel call options while dumping the equity — maximum upside exposure, minimum dead capital. That's the right structure for a binary bet.
+**Intel Foundry** is the wildcard. Intel has publicly disclosed 18A progress and target yield improvements; specific Q1 2026 yield figures are analyst estimates. PowerVia (backside power delivery) is Intel's approach for 18A. <SourceNote tier="analyst">Intel public disclosures; analyst yield estimates from third-party trackers.</SourceNote>
 
 ### The geopolitics you can't ignore
 
-TSMC manufactures ~90% of the world's most advanced chips on a 200-square-mile island 100 miles off the coast of China. This concentration risk keeps defense planners awake at night.
+TSMC manufactures a large majority of the world's leading-edge chips on Taiwan. The exact share varies by node — "90% of most-advanced" is a commonly-cited framing, though less-advanced nodes are more distributed.
 
-The CHIPS Act allocated $52.7B to incentivize domestic U.S. semiconductor manufacturing. TSMC is building 8 fabs in Arizona, targeting ~30% of advanced production at scale. Samsung is building in Taylor, Texas. Intel is expanding in Ohio, Arizona, and Oregon. But none of these fabs will produce at scale this decade. TSMC Arizona's first fab (N4 process) is targeting 2025 production; the more advanced fabs won't come online until 2028–2030.
+The CHIPS Act allocated $52.7B to incentivize domestic US fab capacity. <SourceNote tier="primary">CHIPS and Science Act, public law.</SourceNote> TSMC is building fabs in Arizona. Samsung in Taylor, Texas. Intel in Ohio, Arizona, Oregon. Production timelines for the most advanced nodes extend into 2028–2030.
 
-Meanwhile, China is spending heavily on mature-node capacity (28nm and above) through SMIC and others, and has produced some advanced chips using multi-patterning on DUV tools (circumventing the EUV export ban). But without access to EUV lithography — which the Dutch government, under U.S. pressure, has restricted — China cannot manufacture chips at the leading edge. This makes ASML export controls a geopolitical lever, and ASML's production capacity a strategic asset.
+The Huawei / SMIC story: SemiAnalysis's Huawei Ascend deep dive (Sept 2025) reports that HBM, not logic, is the binding China constraint. SMIC 7nm via DUV multi-patterning is producing at reported 45K wpm (2025). <SourceNote tier="analyst">SemiAnalysis Huawei Ascend piece (Sept 2025); SMIC shipment estimates are analyst-tracked.</SourceNote>
 
 ---
 
 ## EUV lithography — the machine that made the machine
 
-We've reached the bottom of the stack. Every advanced chip in the supply chain — the GPU, the HBM, the networking ASICs — was patterned using extreme ultraviolet light from an ASML machine. This is the ultimate bottleneck, and it has a 60-year history.
+Every advanced chip in the stack — GPU, HBM, networking ASIC — was patterned using extreme ultraviolet light from an ASML machine.
 
 ### A 60-year journey to print with light
 
-Every advanced chip begins the same way: light is projected through a pattern onto silicon, and the exposed areas are chemically etched away. This is photolithography — the art of printing circuits with light. And the history of semiconductor scaling is largely the history of getting that light's wavelength shorter.
+Every advanced chip begins the same way: light is projected through a pattern onto silicon; exposed areas are chemically etched. The history of semiconductor scaling is largely the history of shorter wavelengths.
 
-**The early days (1960s–1980s).** The first lithography tools used contact printing — literally pressing a glass mask onto the wafer. It worked at micron scales but destroyed masks and contaminated wafers. Proximity printing added a small gap. Then projection lithography arrived, keeping the mask far from the wafer and using lenses to shrink the image.
+**Early days (1960s–1980s):** contact → proximity → projection lithography.
 
-**Mercury arc lamps** provided the light source for decades. The industry standardized on specific mercury emission lines: g-line (436nm), then i-line (365nm). Each wavelength reduction enabled smaller features. By the late 1980s, i-line steppers could print features down to ~350nm.
+**Mercury arc lamps** through the late 1980s (g-line 436nm, i-line 365nm).
 
-**The DUV revolution (1990s).** To go smaller, the industry needed shorter wavelengths than mercury could provide. Excimer lasers — gas lasers that produce intense UV pulses — became the answer. KrF (krypton fluoride) excimer lasers at 248nm arrived in the mid-1990s, enabling the 180nm node. Then ArF (argon fluoride) at 193nm took over for 130nm and 90nm.
+**DUV revolution (1990s).** KrF excimer lasers at 248nm, then ArF at 193nm. <SourceNote tier="primary">Standard lithography history; see SPIE reviews.</SourceNote>
 
-**Immersion lithography (2000s).** Here's a beautiful hack: instead of projecting light through air, fill the gap between the lens and wafer with ultra-pure water. Water has a refractive index of 1.44 at 193nm, effectively shrinking the wavelength to 134nm without changing the laser. TSMC's Lin Burn-jeng championed this approach. Combined with clever tricks like multiple patterning (exposing the same layer 2–4 times with shifted masks), immersion 193nm took the industry from 65nm all the way down to 7nm.
-
-But multiple patterning was getting absurd. A single metal layer at 7nm required *four separate exposures*. Each exposure adds cost, defect risk, and cycle time. The masks alone cost $10–15 million per set. The industry needed a fundamentally shorter wavelength.
+**Immersion lithography (2000s).** Water between lens and wafer (refractive index 1.44 at 193nm) effectively shrinks wavelength to 134nm. TSMC's Lin Burn-jeng championed the technique. Combined with multiple patterning (2–4 exposures per layer), immersion 193nm carried the industry to 7nm — but by then a single metal layer needed four exposures, and mask sets cost $10–15M. <SourceNote tier="primary">Lin Burn-jeng papers; SPIE proceedings.</SourceNote>
 
 ### The 40-year EUV saga
 
-The concept of using extreme ultraviolet light (13.5nm wavelength) for lithography dates to the 1980s at Bell Labs and the Lawrence Livermore National Laboratory. At 13.5nm, you could print features in a single exposure that required four passes with 193nm immersion. The physics was elegant. The engineering was nightmarish.
+The concept dates to the 1980s at Bell Labs and LLNL. At 13.5nm, you can print in one exposure what DUV needed four passes for. The problem is that 13.5nm light is absorbed by essentially any material — absorption length is under a micron in silicon, glass, or anything a conventional lens could be made of. You can't use lenses at all; the entire optical path has to be reflection-based, and "reflection" at 13.5nm isn't bulk reflection but Bragg diffraction off a periodic multilayer. Even the best multilayers reflect only ~70% per bounce. With 11 mirrors in the optical path, total throughput is roughly **0.7¹¹ ≈ 2%** — 98% of source light is lost before it hits resist. <SourceNote tier="primary">Bakshi (ed.), *EUV Lithography* (SPIE Press, 2nd ed.).</SourceNote>
 
-**The problem with 13.5nm light is that it's absorbed by everything.** Air, glass, any conventional lens material. You can't use lenses at all — only mirrors. And even the best mirrors only reflect about 70% of EUV light per bounce. With 11 mirrors in the optical path, total throughput is 0.70^11 ≈ 2%. Ninety-eight percent of your light is lost before it reaches the wafer.
+**Mirrors.** Each EUV mirror is a stack of roughly 50 bilayers of alternating Mo (~4 nm) and Si (~2.8 nm), each layer deposited to sub-Ångström tolerance. At 13.5 nm Mo has high refractive-index contrast relative to Si but low absorption; Si acts as a low-loss spacer. The Bragg condition `2d cos(θ) = mλ` with d ≈ 7 nm at near-normal incidence matches 13.5 nm. The theoretical ceiling for Mo/Si at 13.5 nm is ~75% reflectivity, set by residual absorption and interdiffusion (Mo₂Si / MoSi₂ compounds form at interfaces during deposition); realized tools land at ~70% after B₄C diffusion barriers. The 70% isn't engineering laziness — it's near a physical ceiling. Beryllium-based alternatives would push reflectivity a few points higher but are toxic; nothing has shipped. The surfaces themselves are flat to ~0.02 nm RMS, smaller than a single atomic diameter. Carl Zeiss SMT in Oberkochen is the only supplier. <SourceNote tier="primary">Zeiss SMT disclosures; ASML partnership documentation; SPIE Optipedia on EUV; PMC review on Mo/Si multilayer coatings.</SourceNote>
 
-This single fact — 2% optical efficiency — drove every engineering nightmare that followed.
+**Light source.** Fire a high-power CO₂ laser at tin droplets falling through a vacuum chamber at ~50,000 drops/second. Each droplet is hit twice — a pre-pulse flattens the spherical droplet into a low-density disk, a main pulse vaporizes the flat target into a ~500,000°C plasma that emits at 13.5 nm. Two questions the physics answers: *why tin?* and *why the double pulse?* Tin's 4d electrons in high ionization states (Sn⁶⁺ through Sn¹⁴⁺) produce a dense unresolved transition array centered on 13.5 nm — no other element has this property at this wavelength. A solid droplet hit with a single pulse forms a plasma dense enough to reabsorb its own EUV; the pre-pulse expansion into a pancake lets the plasma stay optically thin long enough to emit outward. Conversion efficiency from laser light to 13.5 nm EUV is ~3% in production (4–5% in best-case single-droplet experiments). End-to-end wall-plug-to-at-wafer photons is roughly **5 × 10⁻⁵**: CO₂ laser wall-plug (~12%) × plasma conversion (~3%) × collector + 11 mirrors (~2%). A 1 MW grid draw produces a few watts of EUV at the wafer. The ASML/Trumpf "1000W source" milestone is specifically about the CO₂ drive laser crossing the threshold for 200+ wafers/hour throughput. <SourceNote tier="primary">TRUMPF EUV drive laser; SPIE, "Tin LPP as EUV source"; Applied Physics Letters on conversion efficiency; ASML disclosures.</SourceNote>
 
-**The light source problem.** You need an insanely powerful light source to compensate for that 2% throughput. The solution, which took decades to develop: fire a high-power CO2 laser (now 50kW) at tiny tin droplets falling through a vacuum chamber at 50,000 drops per second. Each droplet is hit twice — first a pre-pulse that flattens it into a pancake shape, then the main pulse that vaporizes it into a 500,000°C plasma. That plasma emits EUV photons at exactly 13.5nm.
+**Masks.** EUV masks are reflective (not transmissive). Single-particle contamination can print defects across every wafer.
 
-Getting this to work reliably was a multi-decade effort. Early prototypes produced a few watts of EUV power. Production tools need 250–500W. Each generation of source power roughly doubled throughput. The breakthrough came when ASML and Trumpf (the laser source supplier) achieved the "1000W source" milestone in late 2024, enabling 200+ wafers per hour — finally matching DUV tool productivity.
+**Failed consortia and ASML's bet.** Through the 1990s–2000s, multiple consortia (EUV LLC — Intel, AMD, Motorola, etc.) pursued EUV and failed to commercialize. Nikon and Canon attempted and abandoned their own programs. ASML bet the company on EUV. They acquired Cymer (DUV light-source leader) in 2013 for $3.7B. Intel, TSMC, and Samsung each invested $1–4B directly into ASML to fund development — an unusual customer-funds-supplier arrangement. <SourceNote tier="primary">ASML / Cymer merger press (2013); ASML Customer Co-Investment Program (2012).</SourceNote>
 
-**The mirror problem.** Each mirror in an EUV system is a stack of ~80 alternating layers of molybdenum and silicon, each a few nanometers thick. The surface must be flat to within 0.02nm — less than the diameter of a single atom. Carl Zeiss SMT in Oberkochen, Germany, is the only company in the world that can make these mirrors. They have been working on EUV optics since the 1990s.
+**First production (2019).** ASML shipped NXE:3400B after roughly $10B in total R&D. Tools cost ~$150M each at launch. <SourceNote tier="primary">ASML annual reports.</SourceNote>
 
-If you measured the surface deviation of a Zeiss EUV mirror scaled up to the size of Germany, the tallest bump would be 0.1mm.
+**Today.** ASML's NXE:3800E lists in the ~$380M range, processes ~200 wafers per hour, weighs ~180 tons, ships in ~40 containers, contains 100,000+ parts from ~800 suppliers. <SourceNote tier="primary">ASML investor materials and product disclosures.</SourceNote>
 
-**The mask problem.** EUV masks are reflective (not transmissive like DUV masks), adding another engineering challenge. They use the same Mo/Si multilayer coating as the mirrors, with an absorber pattern on top. A single particle of contamination — even a few nanometers — can print defects on every wafer. Mask inspection and repair at EUV wavelengths remains one of the hardest problems.
+### High-NA EUV
 
-**Failed consortia and ASML's bet.** Through the 1990s and 2000s, multiple industry consortia tried and failed to commercialize EUV. The EUV LLC consortium (Intel, AMD, Motorola, etc.) burned through hundreds of millions of dollars. Nikon — which dominated DUV lithography alongside Canon — attempted their own EUV program and eventually abandoned it. Canon exited entirely.
-
-ASML, the Dutch company that had been gaining DUV market share through the 2000s, made the critical decision to bet the company on EUV. They acquired Cymer (the leading DUV light source company) in 2013 for $3.7B, gaining the expertise needed for the EUV source. Intel, TSMC, and Samsung each invested $1–4B directly into ASML to fund EUV development — an unprecedented move by customers funding a supplier.
-
-**First production (2019).** After roughly $10 billion in total R&D and 40 years of development, ASML shipped the first production EUV tools (NXE:3400B) in 2019. Samsung and TSMC used them for 7nm and 5nm nodes. The tools cost ~$150M each at the time.
-
-**Today.** ASML's current production tool, the NXE:3800E, costs $380M and processes ~200 wafers per hour. They ship approximately 70 EUV systems per year and are ramping toward ~100 by decade's end. Each tool weighs ~180 tons, requires 40 shipping containers, and contains 100,000+ parts sourced from ~800 suppliers.
-
-### High-NA EUV: the next step
-
-ASML's next-generation system, the EXE:5000 (High-NA EUV), increases the numerical aperture from 0.33 to 0.55 — enabling smaller features for the 2nm generation and beyond. The first tools shipped in 2024 to Intel and TSMC for R&D. They cost upwards of $380M each, require even more complex optics (anamorphic mirrors with different magnification in x and y directions), and won't reach high-volume manufacturing until 2026–2027.
-
-High-NA reduces the minimum printable feature size by ~1.7x. But it also halves the field size, meaning each exposure covers less area on the wafer. The industry is still figuring out stitching strategies to handle this trade-off.
+ASML's EXE:5000 raises numerical aperture from 0.33 to 0.55. First tools shipped to Intel and TSMC for R&D in 2024. Minimum feature size reduces ~1.7×; field size halves. High-volume manufacturing ramps 2026–2027. <SourceNote tier="primary">ASML High-NA EUV disclosures.</SourceNote>
 
 ### The trilateral monopoly
 
-Here's what makes EUV the ultimate bottleneck: three companies, zero alternatives.
-
 <EUVSupplyChain />
-
-No other company has attempted to build an EUV system since Nikon exited. The barriers aren't just capital — it's that the knowledge is distributed across these three companies and decades of iterative engineering. You can't replicate 40 years of accumulated know-how by throwing money at the problem.
 
 ### The hard ceiling math
 
-ASML currently makes about 70 EUV tools per year. Even under aggressive expansion, they hit maybe 100 per year by decade's end. Cumulative installed base: ~700 tools. At 3.5 EUV tools per gigawatt of Rubin-class chips, that's a theoretical ceiling of ~200 GW per year — and that's *if every single tool were allocated to AI*, which obviously won't happen.
+ASML discloses annual EUV tool shipment cadence in its earnings materials and investor day presentations. The trajectory Patel cites on Dwarkesh — ~70 tools in 2026, climbing toward ~100 by end of decade under aggressive expansion, for a cumulative fleet on the order of several hundred by 2030 — is broadly consistent with ASML's own guidance but the specific numbers are his analyst extrapolation. <SourceNote tier="derived">ASML tool cadence: primary (ASML investor disclosures). Cumulative 2030 fleet and year-by-year numbers: Patel's extrapolation.</SourceNote>
 
-For context, there's about 20 GW of AI deployed globally right now. Sam Altman wants a gigawatt per week by 2030 (~52 GW/year). The math simply doesn't work for all the major labs simultaneously. This is the binding constraint of the decade.
+The implied ceiling ("~200 GW/yr of AI chips if 100% of EUV went to AI") uses his AI Accelerator Model's "3.5 EUV tools per GW of Rubin" figure. Working the forward math: ~55K 3nm wafers + ~6K 5nm wafers + ~170K DRAM wafers per GW × ~15 EUV layers on leading-edge logic ≈ roughly 1–2M EUV layer-passes per GW, depending on how multi-pass alignment steps are counted. Divided by tool productivity (~100 wph effective × 70% utilization × 8,000 hrs/year ≈ ~560K passes/tool/year), that pencils at 2.5–4.5 tools/GW. Patel lands at 3.5 — the midpoint. The downstream ceiling (700 tools / 3.5 tools/GW = 200 GW/year) has **±40% sensitivity**: at 2.5 the ceiling is ~280 GW/year, at 4.5 it's ~155. All of the inputs are defensible individually (55K wafers, 15 EUV layers, 200 wph), but the multiplication compounds uncertainty. The *direction* is robust — leading-edge manufacturing throughput is ASML-gated — but "200 GW/year" is the single highest-sensitivity number in the whole thesis, and worth stress-testing against your own inputs before sizing a position off it. <SourceNote tier="derived">SemiAnalysis AI Accelerator Model, exposed via the Dwarkesh interview. Forward-math sensitivity is mine.</SourceNote>
 
-**The investment lens:** ASML trades at roughly 30x forward earnings. The bull case is that AI demand makes their order book durable for the rest of the decade with pricing power on every tool. The bear case is cyclicality — if non-AI chip demand softens, ASML's overall utilization could dip even if AI demand is strong. But the key insight is that ASML's production capacity is the hard ceiling on *all* advanced chip manufacturing globally. There is no substitute. There is no second source.
+ASML trades at roughly 30× forward earnings depending on the day. The pricing-discipline framing — that ASML has historically not raised prices faster than it raised tool capability — is Patel's characterization; ASML's margin evolution is public in its financials. <SourceNote tier="primary">ASML financials.</SourceNote> **The durable insight is that ASML's production capacity is the hard ceiling on leading-edge chip manufacturing globally, with no substitute and no second source.** That part is structural, not forecasted.
 
 ---
 
-## The demand accelerant
+## The margin stack — where the dollar actually goes
 
-Here's where it gets really interesting. Claude Code is at 4% of GitHub commits today and expected to hit 20% by year-end. Autonomous task horizons are doubling every 6–7 months. Each doubling unlocks more of the information-work TAM.
+Every layer has someone taking a cut. Knowing where the cut gets taken is the whole investment thesis.
 
-As Eric Jang wrote: *"I don't think people have begun to fathom how much inference compute we will need. Even if you think you are AGI-pilled, I think you are still underestimating how starved of compute we will be."*
+<MarginStack />
 
-The key transition: ChatGPT/API was Web 1.0 — static request/response. Claude Code and agents are Web 2.0 — dynamic orchestration. The protocol (raw token generation) becomes the means, not the end. Trillions in value in the orchestration layer. But that layer's growth is throttled by every bottleneck above it.
+A common misconception worth correcting: the 70%+ gross-margin figures circulating for frontier labs are usually **compute-only marginal** margins on paid API, not fully-loaded. On a Sonnet-class token the marginal compute cost is ~$5/M blended against $15/M billed revenue — that's where "~67%, rounded to 70%" comes from. The fully-loaded number backs out several things the marginal calculation ignores: (1) the free tier, which has compute cost and no revenue; (2) consumer subscription economics, where ChatGPT/Claude.ai power users can cost 4–10× their $20/month subscription; (3) the ~30% revenue share Anthropic pays Bedrock/Vertex/Foundry for partner-channel capacity, which per Patel effectively looks like a 50% markup Anthropic has to eat on spot-compute-bought-late; and (4) spot-compute premiums when growth spikes outrun reserved capacity. Back all that out and the blended GM lands in the 40–50% range per The Information's reporting on leaked Anthropic funding docs. Patel's April 2026 assertion of a 72% floor for Anthropic inference GM is upper-bound analyst math with specific assumptions (that all incremental compute went to inference, not research), not a direct disclosure. <SourceNote tier="derived">Trade-press reporting (The Information) + Patel's analyst math on Invest Like The Best (April 2026).</SourceNote>
+
+Both numbers are real — they measure different scopes. The gap between them, from ~70% paid-API-marginal down to ~40–50% fully-loaded, is exactly how much margin is flowing *down* the stack to Nvidia, SK Hynix, TSMC, and the partner-channel clouds rather than *staying* at the lab. If labs aren't printing as much margin as SV pitch decks assume, **margin is flowing further down the stack** — which is exactly where capex is going.
+
+---
+
+## Catalysts to watch
+
+These are the thresholds that confirm or break the thesis. I track them every quarter.
+
+<CatalystWatch />
+
+**What's NOT an exit signal:** quarter-to-quarter volatility on 3–5 year theses; one bearish research report; consensus agreeing with the trade. The failure mode is selling conviction to noise.
 
 ---
 
@@ -448,42 +652,43 @@ Here's how I'm thinking about deploying capital across the stack. Weighted by bo
 
 <VerdictBox label="Key allocation principles">
 <p><strong>Weight toward the moving bottleneck.</strong> ~45% in the semiconductor layer (ASML + TSMC + Samsung) because that's where the constraint is tightening. ~15% in memory. ~21% in chip designers. ~16% in infrastructure and networking. ~3% in optionality.</p>
-<p><strong>Match time horizon to bottleneck timing.</strong> Neocloud positions can be shorter duration. Foundry and memory are 2026–28 plays. ASML is the longest-duration hold — the constraint that tightens last but matters most.</p>
+<p><strong>Match time horizon to bottleneck timing.</strong> Neocloud positions are shorter-duration (2026 plays). Memory and foundry are 2026–28 plays. ASML is the longest-duration hold — the constraint that tightens last but matters most.</p>
 <p><strong>Use options where conviction is binary.</strong> Intel calls are a turnaround-or-bust bet. Defined loss, asymmetric upside.</p>
+<p><strong>Accept correlation.</strong> This portfolio is ~0.6–0.7 correlated across names — all one macro bet on AI compute demand. More names ≠ more diversification. Size accordingly.</p>
 </VerdictBox>
 
 ---
 
 ## Benchmarking against Situational Awareness LP
 
-Leopold Aschenbrenner's fund filed a 13F showing $5.5B in gross exposure on $383M AUM (~14x leverage). 29 holdings. Here's how it maps:
+Leopold Aschenbrenner's fund's most recent 13F filing shows a concentrated AI-infra book.
 
 <SAPortfolioTable />
 
 ### Where we agree
 
-**Physical infrastructure over algorithms.** SA holds zero model company equity and zero pure software. Every dollar is in the physical substrate. Our framework agrees — margin flows to bottleneck owners, not to companies spending on the bottleneck.
+**Physical infrastructure over algorithms.** SA's disclosed 13F shows no model-company equity and no pure software. Every dollar is in the physical substrate. <SourceNote tier="primary">SA 13F filing.</SourceNote>
 
-**Memory is accelerating.** SA's 816% increase in SanDisk confirms the thesis. OpenAI has reportedly committed to consume up to 40% of global DRAM capacity.
+**Memory is accelerating.** SA's disclosed SanDisk position change (a large increase) is consistent with the memory-tightening thesis. <SourceNote tier="primary">SA 13F filing.</SourceNote>
 
-**Optical networking is underappreciated.** Lumentum ($479M) and Coherent ($89M) are SA's 4th and 11th largest positions. Data movement scales non-linearly with cluster size.
+**Optical networking is underappreciated.** Lumentum and Coherent are material SA positions. <SourceNote tier="primary">SA 13F filing.</SourceNote>
 
-**The Intel structure is instructive.** Selling 20.2M common shares to exactly 1 while keeping 20.2M call options. Masterclass in capital efficiency for binary outcomes.
+**The Intel structure is instructive.** SA's disclosed Intel position combines common-equity and long-dated call options — a capital-efficient binary-bet structure. <SourceNote tier="primary">SA 13F filing.</SourceNote>
 
 ### Where we diverge
 
-**SA has no ASML, no TSMC, no Samsung Foundry.** This is the biggest gap. Our framework allocates ~45% to the semiconductor layer. SA likely thinks foundry is correctly priced while infra is mispriced — a shorter time horizon bet.
+**SA has no ASML, no TSMC, no Samsung Foundry.** The biggest gap. Our framework allocates ~45% to the semiconductor layer because the 2028–30 ASML window is specifically where the constraint binds hardest.
 
-**SA has no Nvidia.** Zero direct exposure. We have 14%. SA may be betting margin migrates from chip designers to infrastructure providers.
+**SA has no Nvidia.** Our read: Nvidia's disclosed $90B+ long-term contracts ring-fence near-term margin. Multiple compresses before revenue does.
 
-**SA is heavily weighted to neoclouds and BTC miners.** CoreWeave ($1.2B), Core Scientific ($419M), IREN ($329M), Applied Digital ($278M), Cipher ($155M). We have lighter neocloud exposure. SA makes a much more aggressive bet on GPU hosting margin expansion. High conviction, high risk.
+**SA is heavily weighted to neoclouds and BTC-miner AI pivots.** CoreWeave, Core Scientific, IREN, Applied Digital, Cipher. <SourceNote tier="primary">SA 13F filing.</SourceNote>
 
-**The leverage.** ~14x gross leverage means SA is structurally fragile if timing is off. This reinforces diversification across the stack rather than concentration.
+**The leverage.** SA's gross-to-net ratio implies substantial leverage; 13F data + public fund disclosures support the "~$5B gross on ~$380M AUM" framing commonly cited, making the book structurally fragile to timing errors. The unlevered version of the same thesis trades maximum upside for structural durability. <SourceNote tier="derived">13F is primary; leverage ratio is trade-press derived.</SourceNote>
 
 <VerdictBox label="Updated adjustments based on SA crossover">
-<p><strong>Memory: added SNDK alongside SK Hynix / MU.</strong> SA's 816% increase is the signal.</p>
-<p><strong>Networking: increased LITE / COHR to 7%.</strong> Lumentum as SA's 4th-largest position validates cluster-scale optical interconnect.</p>
-<p><strong>No power exposure.</strong> Best gains are behind us, and power is a cost — not a constraint — on GPU TCO.</p>
+<p><strong>Memory: added SNDK alongside SK Hynix / MU.</strong> SA's SanDisk increase is the signal.</p>
+<p><strong>Networking: increased LITE / COHR to 7%.</strong> SA positioning + the superlinear cluster-scaling math.</p>
+<p><strong>No power exposure in core.</strong> Patel's March 2026 Dwarkesh framing is that US power is no longer the binding constraint — behind-the-meter gas + peaker-displacement can unlock a non-trivial share of US grid capacity. Power moved from bottleneck to cost.</p>
 </VerdictBox>
 
 ---
@@ -498,18 +703,18 @@ Adapted from Thiel's four monopoly sources. I track these quarterly.
 
 ## What breaks the thesis
 
-I'd be dishonest if I didn't lay out the risks.
+**Demand collapse.** If AI models stop improving or adoption stalls, the capex cycle looks like overbuilding. The strongest counter today: H100 rental prices rose rather than fell over the last two quarters (SemiAnalysis tracker), and Anthropic's reported ARR trajectory continues to accelerate per multiple trade-press outlets. If supply were overbuilt, prices would be falling. That said, the dot-com 2.0 scenario is always possible. Base-rate estimate: ~10–15% probability over 5 years. <SourceNote tier="derived">Base-rate is my own estimate.</SourceNote>
 
-**Demand collapse.** If AI models stop improving or adoption stalls, the entire capex cycle looks like overbuilding. Patel's counter: the revenue is real ($60B+ Anthropic trajectory, Nvidia $216B rev). But the dot-com scenario is always possible.
+**Algorithmic efficiency.** The specific risk: breakthroughs that reduce HBM demand without being absorbed by larger models. Google's TurboQuant (Feb 2026) demonstrated 2–3× KV compression via random rotation + Gaussian codebooks, and memory stocks reacted on publication. DeepSeek's MLA already compresses KV ~14× structurally per the DeepSeek-V2 paper. Mamba and state-space models are O(1) memory per token. **Counter-argument:** every efficiency gain of 2022–2026 (PagedAttention, continuous batching, FP8, FP4, MLA, MTP, prompt caching, disaggregated serving) has been absorbed by demand growth. Result: ~1000× tokens-per-dollar improvement *and* rising rental prices. Leading signal to watch: HBM3E production guidance. If SK Hynix, Micron, and Samsung start cutting, the efficiency-absorption pattern has broken. <SourceNote tier="derived">Composite of primary papers + analyst tracking.</SourceNote>
 
-**Algorithmic efficiency.** If models get dramatically more efficient — 10x fewer FLOPs for same quality — hardware demand could plateau. Watch for architectural breakthroughs.
+**Taiwan.** A blockade or attack on TSMC would be catastrophic. Patel's Dwarkesh estimate of the post-event capacity world (on the order of "10–20 GW across Intel and Samsung") is a scenario, not a forecast. TSMC Arizona is a partial hedge but won't scale this decade. The only real protection is position sizing: **size TSMC to what you can afford to lose.** <SourceNote tier="speaker">Patel, Dwarkesh (March 2026).</SourceNote>
 
-**Taiwan.** China's Five-Year Plan language has shifted. A blockade or attack on TSMC would be catastrophic for this entire portfolio. TSMC Arizona (8 fabs planned, ~30% of advanced production at scale) is the hedge but won't be ready this decade.
+**Regulatory.** Antitrust on Nvidia (low but not zero); export controls expanding to allies (moderate probability); CHIPS Act reversal (low, bipartisan). US government currently encourages the buildout rather than constraining it.
 
-**Regulatory.** Antitrust, export controls, energy policy. Currently the US government is encouraging the buildout, not constraining it.
+**Public backlash.** Patel flagged this explicitly on Invest Like The Best (April 2026), predicting "large-scale protests against AI" within three months. His characterization of specific incidents (Sam Altman's home being targeted) should not be repeated as fact without independent corroboration; I have not verified those incidents against credible security reporting. The broader polling point — that AI adoption sentiment has declined — is corroborated in Pew and Edelman trust-barometer data. The mechanism to watch: a major political figure weaponizing AI backlash ahead of the 2026 midterms. If that happens, the regulatory risk node above goes from low-probability to live. <SourceNote tier="speaker">Predictive; incident-specific claims are Patel's and not independently corroborated.</SourceNote>
 
-**Concentration risk.** This portfolio is extremely correlated to one macro thesis. If inference demand curves flatten, everything moves against you simultaneously. Size accordingly.
+**Concentration risk — the real one.** This portfolio is estimated at ~0.6–0.7 correlated across names. All one macro bet. Adding more AI names ≠ diversification. **Size the portfolio itself, not just the individual positions.** My weighted-bear-probability estimate stacking the risks above is ~35% over 5 years. Base-case weighted expected return ~30% after risk adjustment. Real alpha comes from timing the rotation and the asymmetric bets, not the core positions. <SourceNote tier="derived">Correlation and probability estimates are mine.</SourceNote>
 
 ---
 
-*This is a research synthesis, not financial advice. It draws from Dylan Patel / SemiAnalysis, Ben Thompson / Stratechery, Daniel Gross / AGI Trades, Leopold Aschenbrenner / Situational Awareness LP 13F, Eric Jang, and the SemiAnalysis Claude Code thesis. All data as of March 2026. Do your own research. Size positions to what you can afford to lose.*
+*This is a research synthesis, not financial advice. Full source dossier in the `/knowledge/` folder of this repo, including transcripts and provenance notes. Primary sources cited inline via the `Primary / Analyst / Speaker / Derived` tier system. Where claims come from a named individual's podcast or interview rather than a primary document, they're tagged explicitly — this is informed evidence from a well-positioned observer, not independently verified data. Size positions to what you can afford to lose.*

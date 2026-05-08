@@ -2,22 +2,22 @@ const cards = [
   {
     label: "Hyperscaler capex 2026",
     value: "$600B+",
-    note: "Big four combined. ~$1T across full supply chain. Much of this is setup for 2027–29.",
+    note: "Big-4 combined. ~$1T full supply chain. 30% of this now flows to memory — roughly $180B — with Nvidia margin stacked inside.",
   },
   {
-    label: "TSMC capacity shortfall",
-    value: "3x short",
-    note: 'Chairman C.C. Wei admitted advanced-node capacity is "about three times short" of customer demand.',
+    label: "H100 rental 6-mo move",
+    value: "+40%",
+    note: "$1.70/hr (Oct 2025) → $2.35/hr (Mar 2026). Labs signing 2–3 yr deals at $2.40. GPUs are appreciating, not depreciating — direct refutation of the Burry short.",
   },
   {
-    label: "H100 spot price",
-    value: "$2.40/hr",
-    note: "Labs signing 2-3 year deals above this. Higher than at launch. GPUs are appreciating, not depreciating.",
+    label: "Demand compounding in 2 yrs",
+    value: "1,000,000×",
+    note: "Jensen, GTC 2026: per-workload demand up 10,000×; usage up 100×; total up 1M×. Efficiency at 10×/year loses the race.",
   },
   {
-    label: "Hard ceiling by 2030",
+    label: "ASML 2030 hard ceiling",
     value: "~200 GW",
-    note: "Set by EUV tool production at ASML. ~700 cumulative tools, 3.5 per GW. Not enough for AGI ambitions.",
+    note: "~100 tools/year max, ~700 cumulative fleet, 3.5 tools per GW of Rubin. Altman's 52 GW/yr target = 25% of all global EUV capacity.",
   },
 ];
 
