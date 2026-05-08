@@ -28,8 +28,6 @@ import { FiveMultipliers } from "@/components/blog/FiveMultipliers";
 import { MarginStack } from "@/components/blog/MarginStack";
 import { RotationTable } from "@/components/blog/RotationTable";
 import { CatalystWatch } from "@/components/blog/CatalystWatch";
-import { SourceNote } from "@/components/blog/SourceNote";
-import { ProvenanceLegend } from "@/components/blog/ProvenanceLegend";
 import { LayerPipeline } from "@/components/blog/revradar/LayerPipeline";
 import { ContextFunnel } from "@/components/blog/revradar/ContextFunnel";
 import { ActionRoutingFlow } from "@/components/blog/revradar/ActionRoutingFlow";
@@ -62,8 +60,6 @@ const mdxComponents = {
   MarginStack,
   RotationTable,
   CatalystWatch,
-  SourceNote,
-  ProvenanceLegend,
   LayerPipeline,
   ContextFunnel,
   ActionRoutingFlow,
