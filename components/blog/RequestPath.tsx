@@ -640,7 +640,98 @@ POST /v1/messages
   },
 ];
 
-export function RequestPath(): React.ReactElement {
+function StationCard({ s, showArrow }: { s: Station; showArrow: boolean }): React.ReactElement {
+  const meta = zoneMeta[s.zone];
+  return (
+    <div>
+      <div
+        className={`border ${meta.ring} rounded-lg bg-white dark:bg-gray-950/40 overflow-hidden`}
+      >
+        {/* Station header bar */}
+        <div className="flex items-start justify-between gap-4 px-4 pt-3 pb-2 border-b border-gray-100 dark:border-gray-800/60">
+          <div className="flex items-baseline gap-3 flex-1 min-w-0">
+            <span className="font-mono text-[10px] text-gray-400 pt-0.5">
+              {s.num}
+            </span>
+            <div className="flex items-center gap-2">
+              <span className={`${meta.dot} w-1.5 h-1.5 rounded-full`} />
+              <span
+                className={`${meta.text} font-mono text-[11px] font-medium uppercase tracking-wider`}
+              >
+                {s.name}
+              </span>
+            </div>
+          </div>
+          {s.stat && (
+            <span className="font-mono text-[10px] text-gray-500 whitespace-nowrap pt-0.5 hidden sm:inline">
+              {s.stat}
+            </span>
+          )}
+        </div>
+
+        {/* One-liner */}
+        <div className="px-4 py-2 border-b border-gray-100 dark:border-gray-800/60">
+          <p className="text-[11px] text-gray-600 dark:text-gray-400 leading-relaxed">
+            {s.oneLine}
+          </p>
+          {s.stat && (
+            <p className="font-mono text-[10px] text-gray-500 mt-1 sm:hidden">
+              {s.stat}
+            </p>
+          )}
+        </div>
+
+        {/* Where — physical location */}
+        <div className="px-4 py-2.5 border-b border-gray-100 dark:border-gray-800/60 bg-gray-50/60 dark:bg-gray-900/40">
+          <p className="font-mono text-[9px] uppercase tracking-widest text-gray-500 mb-1.5">
+            Where it runs
+          </p>
+          <dl className="grid grid-cols-[64px_1fr] gap-x-3 gap-y-1 text-[10.5px]">
+            <dt className="font-mono text-gray-400">hw</dt>
+            <dd className="text-gray-700 dark:text-gray-300 leading-snug">
+              {s.where.hw}
+            </dd>
+            <dt className="font-mono text-gray-400">net</dt>
+            <dd className="text-gray-700 dark:text-gray-300 leading-snug">
+              {s.where.net}
+            </dd>
+            <dt className="font-mono text-gray-400">site</dt>
+            <dd className="text-gray-700 dark:text-gray-300 leading-snug">
+              {s.where.site}
+            </dd>
+          </dl>
+        </div>
+
+        {/* Detail panel */}
+        <div className="px-4 py-3">{s.panel}</div>
+      </div>
+
+      {showArrow && (
+        <div className="flex justify-center py-1.5">
+          <span className="text-gray-400 font-mono text-[12px]">↓</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface RequestPathProps {
+  /** When set, render only the matching station (e.g. "04") in a standalone frame.
+   *  When omitted, render the full 11-station trace with header + legend + footer. */
+  station?: string;
+}
+
+export function RequestPath({ station }: RequestPathProps = {}): React.ReactElement | null {
+  if (station) {
+    const s = stations.find((st) => st.num === station);
+    if (!s) return null;
+    return (
+      <div className="not-prose my-6 clear-both">
+        <StationCard s={s} showArrow={false} />
+      </div>
+    );
+  }
+
   return (
     <div className="not-prose my-8 rounded-lg border border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900/50 overflow-hidden">
       {/* Header */}
@@ -668,80 +759,9 @@ export function RequestPath(): React.ReactElement {
 
       {/* Stations */}
       <div className="px-3 sm:px-6 py-5 space-y-4">
-        {stations.map((s, i) => {
-          const meta = zoneMeta[s.zone];
-          return (
-            <div key={s.num}>
-              <div
-                className={`border ${meta.ring} rounded-lg bg-white dark:bg-gray-950/40 overflow-hidden`}
-              >
-                {/* Station header bar */}
-                <div className="flex items-start justify-between gap-4 px-4 pt-3 pb-2 border-b border-gray-100 dark:border-gray-800/60">
-                  <div className="flex items-baseline gap-3 flex-1 min-w-0">
-                    <span className="font-mono text-[10px] text-gray-400 pt-0.5">
-                      {s.num}
-                    </span>
-                    <div className="flex items-center gap-2">
-                      <span className={`${meta.dot} w-1.5 h-1.5 rounded-full`} />
-                      <span
-                        className={`${meta.text} font-mono text-[11px] font-medium uppercase tracking-wider`}
-                      >
-                        {s.name}
-                      </span>
-                    </div>
-                  </div>
-                  {s.stat && (
-                    <span className="font-mono text-[10px] text-gray-500 whitespace-nowrap pt-0.5 hidden sm:inline">
-                      {s.stat}
-                    </span>
-                  )}
-                </div>
-
-                {/* One-liner */}
-                <div className="px-4 py-2 border-b border-gray-100 dark:border-gray-800/60">
-                  <p className="text-[11px] text-gray-600 dark:text-gray-400 leading-relaxed">
-                    {s.oneLine}
-                  </p>
-                  {s.stat && (
-                    <p className="font-mono text-[10px] text-gray-500 mt-1 sm:hidden">
-                      {s.stat}
-                    </p>
-                  )}
-                </div>
-
-                {/* Where — physical location */}
-                <div className="px-4 py-2.5 border-b border-gray-100 dark:border-gray-800/60 bg-gray-50/60 dark:bg-gray-900/40">
-                  <p className="font-mono text-[9px] uppercase tracking-widest text-gray-500 mb-1.5">
-                    Where it runs
-                  </p>
-                  <dl className="grid grid-cols-[64px_1fr] gap-x-3 gap-y-1 text-[10.5px]">
-                    <dt className="font-mono text-gray-400">hw</dt>
-                    <dd className="text-gray-700 dark:text-gray-300 leading-snug">
-                      {s.where.hw}
-                    </dd>
-                    <dt className="font-mono text-gray-400">net</dt>
-                    <dd className="text-gray-700 dark:text-gray-300 leading-snug">
-                      {s.where.net}
-                    </dd>
-                    <dt className="font-mono text-gray-400">site</dt>
-                    <dd className="text-gray-700 dark:text-gray-300 leading-snug">
-                      {s.where.site}
-                    </dd>
-                  </dl>
-                </div>
-
-                {/* Detail panel */}
-                <div className="px-4 py-3">{s.panel}</div>
-              </div>
-
-              {i < stations.length - 1 && (
-                <div className="flex justify-center py-1.5">
-                  <span className="text-gray-400 font-mono text-[12px]">↓</span>
-                </div>
-              )}
-            </div>
-          );
-        })}
+        {stations.map((s, i) => (
+          <StationCard key={s.num} s={s} showArrow={i < stations.length - 1} />
+        ))}
       </div>
 
       {/* Footer */}

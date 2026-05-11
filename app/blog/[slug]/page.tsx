@@ -14,6 +14,7 @@ import { AllocationTable } from "@/components/blog/AllocationTable";
 import { Scorecard } from "@/components/blog/Scorecard";
 import { SAPortfolioTable } from "@/components/blog/SAPortfolioTable";
 import { VerdictBox } from "@/components/blog/VerdictBox";
+import { SideNote } from "@/components/blog/SideNote";
 import { ComputeIndexTracker } from "@/components/blog/ComputeIndexTracker";
 import { BlogImage } from "@/components/blog/BlogImage";
 import { EUVSupplyChain } from "@/components/blog/EUVSupplyChain";
@@ -46,6 +47,7 @@ const mdxComponents = {
   Scorecard,
   SAPortfolioTable,
   VerdictBox,
+  SideNote,
   ComputeIndexTracker,
   BlogImage,
   EUVSupplyChain,
@@ -93,7 +95,7 @@ export default async function BlogPost({ params }: PageProps) {
   if (!post) notFound();
 
   return (
-    <div className="max-w-2xl mx-auto px-6 py-12">
+    <div className="max-w-2xl min-[1220px]:max-w-[60rem] min-[1220px]:pr-[18rem] mx-auto px-6 py-12">
       <Link
         href="/blog"
         className="text-gray-600 dark:text-gray-400 hover:text-black dark:hover:text-white underline text-sm mb-8 inline-block"

@@ -20,25 +20,251 @@ Inspired by Daniel Gross's AGI Trades. Partially to deeply understand the stack.
 
 ## What actually happened
 
-Here's the step-by-step path of my request, from keystroke to response — every operation tagged with the hardware it actually runs on:
+Here's the literal path of one request — eleven stations, from keystroke on my laptop to the first token painting on my screen. Read the prose paragraphs and you'll understand the trace top to bottom; the diagrams show what's actually on the wire; the sidenotes (right margin on desktop, between paragraphs on mobile) define any term that wasn't introduced yet. Zero prior LLM knowledge required — every jargon term gets glossed the first time it appears.
 
-<RequestPath />
+### 1. You hit return — a 50K-token request leaves your laptop
 
-That diagram is accurate but it hides the single most important fact about modern inference. Every request goes through **two phases with fundamentally different hardware profiles**, and every serving technique invented in the last five years is a response to the same asymmetry.
+<RequestPath station="01" />
+
+The thing that looks tiny on screen — "Add dark mode functionality to my blog." — is the smallest piece of what gets sent. Claude Code wraps your message in a JSON body that also carries the system prompt (Anthropic's pre-loaded instructions for how Claude Code should behave), every tool schema (the JSON shape of every action the model can take: Read, Edit, Bash, etc.), and the entire conversation history of this session. That bundle is ~50,000 tokens before you typed anything. **Your dark-mode sentence itself is 7 tokens.** The other 49,993 are context the model needs to act on those 7.
+
+<SideNote label="Token">
+The smallest unit the model reads. Roughly **¾ of an English word**, on average — "functionality" is one token, "dark" is one token, " dark" (with a leading space) is a different token. The model sees integer IDs, not characters. We tokenize at station 4.
+</SideNote>
+
+<SideNote label="System prompt">
+A long block of instructions Anthropic pre-loads at the start of every Claude Code session — tone, tool-use rules, safety constraints, formatting conventions. Invisible to you, but counted against your token budget. Typically 5–8K tokens.
+</SideNote>
+
+<SideNote label="Tool schema">
+A JSON description of one tool the model can call (its name, what arguments it takes, what it returns). Five or six tools' worth of schemas can run another 1–2K tokens. The model has to "see" these in every request to know what's callable.
+</SideNote>
+
+Why does this matter? Because **every cost in the rest of this section scales with how big that bundle is.** GPU compute, memory bandwidth, network latency, cache hit rate — all of them are downstream of "how many tokens did you just send."
+
+### 2. TLS to Cloudflare's edge — the boring half-second
+
+<RequestPath station="02" />
+
+The JSON body becomes bytes on a TLS-encrypted HTTP/2 connection to `api.anthropic.com`, which resolves (via DNS) to an Anthropic-owned IP block fronted by Cloudflare's edge network. Round-trip from your laptop to the nearest Cloudflare PoP is ~10–30 ms. This is the same plumbing every HTTPS request on the internet uses; I mention it only because the *next* station is where things stop being generic.
+
+<SideNote label="TLS 1.3">
+The encryption layer underneath HTTPS. **1.3** is the modern version: one round-trip handshake, modern ciphers (ChaCha20-Poly1305 / AES-GCM), forward-secret by default.
+</SideNote>
+
+<SideNote label="HTTP/2">
+A streaming-capable version of HTTP. Lets the server flush partial responses (one token at a time) over the same connection. We use this at station 10 to stream tokens back as soon as they're generated.
+</SideNote>
+
+<SideNote label="Cloudflare PoP">
+A point of presence — a datacenter where Cloudflare runs edge servers near you. Anthropic terminates TLS at Cloudflare's edge, then ships the decrypted request inside its own private network to the GPU pool.
+</SideNote>
+
+### 3. Routing — the cache decides the economics
+
+<RequestPath station="03" />
+
+Past the edge, Anthropic's serving frontend authenticates your API key, checks rate limits, and then does the move that makes agents economic: **prefix-affinity routing.** It hashes the system prompt + tools + conversation history, looks up which GPU replica recently saw that exact prefix, and steers your request to the same replica. That replica still has the K/V projections for those 49,950 prefix tokens sitting in its **KV cache** (the model's working memory of prior tokens). It skips redoing prefill on them. Only the 50-token tail — your new dark-mode sentence plus the immediately preceding turn — needs fresh compute.
+
+<SideNote label="KV cache">
+The model's working memory. For every past token in the conversation, the model stored two vectors (a "key" and a "value") inside attention. Those vectors are the conversation's residue on the GPU. Decode reads them every step. We size them at station 8.
+</SideNote>
+
+<SideNote label="Prefix cache hit">
+When a new request's beginning (system prompt + tools + earlier turns) matches a request the same replica saw recently, that replica reuses the cached KV vectors instead of recomputing them. Claude Code's hit rate is **84–92%** — the difference between agents being routine and uneconomic.
+</SideNote>
+
+<SideNote label="Replica">
+One copy of the model loaded onto a group of GPUs, ready to serve requests. A serving fleet runs many replicas in parallel; the router decides which one a request goes to.
+</SideNote>
+
+The economics: cache reads bill at ~10% of the base input rate; cache writes bill at ~125%. For a Claude Code session with a stable 50K prefix, the effective input rate drops from $3/M to roughly $0.50/M — a ~6× reduction. Without this trick, the next twenty stations would run on the full 50,000 tokens of context, ~22 times per task. Your bill would be ~6× higher and the user-perceived latency would jump from ~150 ms to ~3 seconds before the first token streamed back.
+
+### 4. Tokenization — words become integers (this is BPE)
+
+<RequestPath station="04" />
+
+The new tail of your conversation is a string. Models don't read strings; they read sequences of integers from a fixed vocabulary. The tokenizer's job is to break the string into the largest matching pieces in its vocabulary and emit the corresponding integer ID for each. Claude uses **BPE** (byte-pair encoding), the same family as OpenAI's `cl100k_base` and `o200k_base` tokenizers.
+
+<SideNote label="BPE (byte-pair encoding)">
+The training-time algorithm that built the tokenizer's vocabulary. Start from raw bytes. Find the most frequent adjacent byte pair across a giant text corpus, merge it into a new token, repeat ~50,000–200,000 times. The result is a vocabulary where common English words ("the", "and", " functionality") are single tokens, rare ones split into known subword chunks.
+</SideNote>
+
+<SideNote label="Subword tokenization">
+Why not whole words? A real-world vocabulary has millions of entries (every name, typo, code identifier) and your embedding table would be enormous. Why not characters? Sequences become 5–10× longer and every cost scales with sequence length. Subwords are the compromise: roughly a 50K–200K vocab, common things in one piece, rare things in 2–4 pieces.
+</SideNote>
+
+<SideNote label="Vocabulary size">
+For Llama-3 it's **128,256** tokens; for GPT-4 (o200k_base) it's **200,019**; for Gemma 2 it's **256,000**. Bigger vocabs cover more languages and code at fewer tokens per sentence, at the cost of a bigger embedding table.
+</SideNote>
+
+For our request, "add dark mode functionality" becomes 4 integers: `add` (723), ` dark` (6453), ` mode` (3941), ` functionality` (15293). Note the leading spaces — they're part of the token. ` functionality` is one token; without the space it splits to `function` + `ality`. Anchor this: **every later step's cost scales with how many of these integers you produce.** A model with a denser tokenizer (more characters per token on average) is cheaper for the same prompt.
+
+### 5. Embedding lookup — integers become vectors
+
+<RequestPath station="05" />
+
+Each integer ID becomes a row of a giant lookup table called the embedding matrix. For Llama-3 70B that table is 128,256 rows × 8,192 columns in BF16 — **2.1 GB** living in HBM next to the GPU die. The lookup is a simple gather: pull row 723, pull row 6453, pull row 3941, pull row 15293. Each row is an 8,192-float vector.
+
+<SideNote label="Embedding">
+A lookup table that turns each token ID into a fixed-length numeric vector. After this step, every token's identity is gone — what's left is its 8,192-dimensional **direction** in vector space. Two tokens with similar meaning have similar directions, learned during pretraining.
+</SideNote>
+
+<SideNote label="BF16">
+"Brain float 16" — a 16-bit floating-point format. Half the bytes of FP32, same exponent range, less precision. The frontier inference default since 2023. **FP8** halves it again; **FP4** halves it once more — the Blackwell-era inference throughput win.
+</SideNote>
+
+<SideNote label="HBM">
+High-Bandwidth Memory. Fast DRAM stacked vertically and soldered to the same silicon interposer as the GPU die. **H100 has 80 GB at 3.35 TB/s; H200 141 GB at 4.8 TB/s; B200 192 GB.** Capacity and bandwidth are different scarcities — we hit both at station 8.
+</SideNote>
+
+<SideNote label="lm_head">
+The mirror-image table at the *end* of the stack. Same shape as the input embedding, but used in reverse: takes the final 8,192-vector and projects back to 128,256 scores — one per possible next token. We use it at station 9.
+</SideNote>
+
+That 8,192-float vector for ` dark` (row 6453) is the token's entire presence on the GPU from this point on. Whatever ` dark` "means" to Llama-3, that meaning is 8,192 specific BF16 numbers — most clustered in `[-0.05, 0.05]`, a few outlier dimensions running 5–10× larger. The diagram above shows the actual first row of those numbers. Everything downstream is math on these vectors.
+
+### 6. RoPE — adding position by rotating
+
+<RequestPath station="06" />
+
+The embedding table is positional-blind: row 6453 for ` dark` is the same vector whether ` dark` appears at position 0 or position 50,000. But position matters — "add dark mode" and "mode dark add" should produce very different attention patterns. **RoPE** (rotary position embedding) injects position by rotating each token's Q and K vectors by an angle that grows with position. Pair up the 128 dimensions of each attention head, rotate pair `i` by angle `θᵢ = pos · base^(-2i/128)`, done.
+
+<SideNote label="RoPE (rotary position embedding)">
+Position information injected by rotating Q/K vectors as a function of token position. Low-frequency dimension-pairs spin fast (encode local order); high-frequency pairs barely move (encode coarse, long-range position). The trick is purely multiplicative — no learned parameters, no extra parameters.
+</SideNote>
+
+<SideNote label="Q / K / V">
+Query, Key, Value. Three different linear projections of each token's embedding, used inside attention. **Q** asks "what am I looking for?", **K** says "what do I expose?", **V** says "what do I contribute if attended to?". RoPE rotates Q and K, not V.
+</SideNote>
+
+<SideNote label="Context-length extension">
+Because RoPE encodes position in rotation frequencies, you can extend a model from 8K to 128K context by **rescaling the base frequency** and briefly fine-tuning. YaRN and Meta's llama3-scaling are the published methods. This is why context windows keep growing faster than model generations do.
+</SideNote>
+
+This is the trick that lets context-window extension be cheap. A model trained on 8K-token sequences can be stretched to 128K or 200K by rescaling the rotation base and fine-tuning on under 1% of original pretraining tokens. For our request, at position 0 (`add`) nothing rotates. At position 1 (` dark`) every pair rotates by a position-1 angle. At position 50,000 (deep in the conversation history) most pairs have spun around many times; only the highest-frequency pairs (the ones that encode long-range information) still carry coherent signal.
+
+### 7. The transformer block — 80 layers of attention + MLP
+
+<RequestPath station="07" />
+
+This is the part that costs the money. Inside Llama-3 70B, each of the 4 dark-mode tokens (plus the 49,996 prefix tokens) goes through **80 identical transformer layers in sequence**. Each layer is, in order: normalize → attention → add residual → normalize → MLP → add residual. Same operation, 80 stacked copies.
+
+<SideNote label="Attention">
+For each token, **look at every prior token, weighted by how relevant it is to me right now.** Compute scores via Q · Kᵀ, softmax, then take a weighted sum of V vectors. The output is the token's view of the conversation so far through this layer's "lens."
+</SideNote>
+
+<SideNote label="GQA (grouped-query attention)">
+Llama-3 has 64 query heads but only **8** K/V heads — groups of 8 query heads share each K/V head. This cuts the KV cache size by 8×. Pure multi-head attention (the original 2017 design) would make Llama-3 70B undeployable: KV cache alone would exceed the weights.
+</SideNote>
+
+<SideNote label="MLP (multi-layer perceptron)">
+A small two-layer feedforward network applied independently to each token. Llama-3 70B uses SwiGLU: gate × up → multiply → down, with intermediate dimension 28,672. **MLP weights are the majority of model parameters** — the place where most of the model's stored "knowledge" lives.
+</SideNote>
+
+<SideNote label="Residual stream">
+Every layer adds its output to the layer's input rather than replacing it. The "residual stream" is the running accumulator that each token's vector represents — every layer's contribution is a refinement, not a replacement.
+</SideNote>
+
+The diagram above shows the literal Python-like pseudocode for one layer. **The same code path runs in both phases of inference**, but with one critical asymmetry: at *prefill* all 4 input tokens flow through this layer together in one matrix multiplication (the GPU's tensor cores light up at ~50–70% peak utilization — they were built for this). At *decode*, only one new token at a time flows through (the matmul shrinks to a vector-matrix product, tensor cores sit ~90% idle, and the bottleneck shifts from compute to **memory bandwidth** — reading the 140 GB of weights becomes the wall-clock floor).
+
+<SideNote label="Prefill vs decode">
+**Prefill** processes the entire prompt in parallel: one big matmul, compute-bound, expensive in FLOPs but bandwidth is fine. **Decode** generates one output token at a time: tiny matmul, memory-bandwidth-bound, FLOPs are nearly free but you still have to re-read every weight every step. Same GPU, two completely different bottlenecks.
+</SideNote>
+
+This is the asymmetry that *every* modern serving technique is a response to:
 
 <InferencePhases />
 
-Prefill processes the entire prompt in parallel — one big matrix multiplication per layer. The roofline threshold that decides compute-bound vs memory-bound on H100 SXM5 is `peak_FLOPs / peak_bandwidth` = 989 TFLOPS / 3.35 TB/s ≈ **~295 FLOPs/byte** at BF16. Prefill's QKV projection runs at roughly `2 · n / dtype_bytes` FLOPs/byte where `n` is sequence length, so a 4K-token prompt in BF16 lands at ~4,000 FLOPs/byte — an order of magnitude past the threshold. Prefill is **compute-bound**. Then generation starts. The decode matmul is the clean inverse: batch-1, seq-1 math means the weight read dominates, giving exactly **1 FLOP/byte at BF16, 2 at FP8, 4 at FP4** — reading 2d² bytes of weights to do 2d² FLOPs. That's ~0.3% of peak against the 295 threshold. Decode is **memory-bandwidth-bound**. The wall-clock floor per token is `model_weight_bytes / HBM_bandwidth`: Llama-3 70B at BF16 is 140 GB / 3.35 TB/s ≈ **42 ms/token** on a single H100 at theoretical peak. The same GPU does both phases. You pay for both cycles. One of them runs under-utilized.
+Why does the asymmetry matter? Because if you size your fleet for prefill, decode wastes bandwidth. If you size for decode, prefill wastes FLOPs. Continuous batching, PagedAttention, FP4 weights on Blackwell, speculative decoding, disaggregated serving — every line on the curve of token-price decline over the last three years is a clever response to running both phases on one piece of hardware. We unpack each later in this section.
 
-Batching is what keeps decode from being a catastrophe. With B concurrent decode requests sharing the same weight read, effective intensity becomes `B / dtype_bytes` — a B=64 continuous batch at BF16 gives ~16 FLOPs/byte, still bandwidth-bound but tensor-core utilization lifts from `<1%` of peak to the ~28% you see in InferenceMAX-style production numbers. The hardware isn't sitting idle; it's being paid for to wait on memory, and batching converts that waiting into useful work.
+### 8. The KV cache — what long context literally costs
 
-This asymmetry is why modern serving is choreography for GPUs, not a single function call.
+<RequestPath station="08" />
+
+At each of the 80 attention layers, the K and V projections of every token are kept in HBM so the next decode step doesn't recompute them. The size formula is mechanical: per token, per layer, with Llama-3 70B's grouped-query attention (8 KV heads, head dim 128, BF16), the cache costs `2 × 8 × 128 × 2 = 4,096 bytes`. Across 80 layers: **~320 KB per token**.
+
+<SideNote label="KV cache size formula">
+`2 × n_layers × n_kv_heads × head_dim × seq_len × batch × dtype_bytes`. The leading 2 is K plus V. `n_kv_heads` is the **post-GQA** count (8 for Llama-3 70B, not 64) — GQA is the reason this number is tractable.
+</SideNote>
+
+<SideNote label="PagedAttention">
+The vLLM-era scheme: chunk the KV cache into fixed-size blocks (typically 16 tokens, ~80 KB each). Two requests that share a 50K prefix point at the same physical blocks. Copy-on-write only on divergence. **KV-memory waste drops from 60–80% to under 4%**. Native paged-KV support is now in FlashAttention-3 and FlashInfer.
+</SideNote>
+
+At small scale that's small numbers. At Claude Code's working scale (50K tokens of context) the cache is **~16 GB** — comparable to the weights themselves. At 1M tokens of context, the cache is **~320 GB**, larger than any single GPU's HBM, and the model has to be sharded across multiple GPUs to fit it. KV-cache size, not weight size, is what bounds how long a context window can be in production. The downstream consequences (sliding-window attention, attention sinks, INT8/FP8/NVFP4 KV quantization, DeepSeek's MLA) are all attempts to shrink it.
+
+### 9. lm_head + sample — picking the next token
+
+<RequestPath station="09" />
+
+At the end of the 80th layer, the model has produced one 8,192-vector per input token. To generate the next output token, take the last token's vector and project it through `lm_head` — a 128,256 × 8,192 matmul that produces 128,256 raw scores called **logits**, one per possible next token. Apply softmax to turn the logits into probabilities. Apply a sampling rule (greedy, top-k, top-p, nucleus). Pick one integer ID. Detokenize.
+
+<SideNote label="Logits">
+The raw real-valued scores the model emits before softmax. Logit 40 ("I") might be `8.2`; logit 1701 ("Looking") might be `7.1`. Bigger logit = more probable.
+</SideNote>
+
+<SideNote label="Softmax">
+Turns a vector of arbitrary reals into probabilities that sum to 1. `exp(xᵢ) / Σⱼ exp(xⱼ)`. The exponential makes the biggest logit dominate; differences in logit space become ratios in probability space.
+</SideNote>
+
+<SideNote label="Temperature">
+A divisor on logits before softmax: `softmax(logits / T)`. **T = 0** is deterministic — always pick the top logit. **T = 1** keeps the raw distribution. Higher T → more variety, more risk. Claude Code uses T ≈ 0 for code generation.
+</SideNote>
+
+<SideNote label="Top-p / top-k">
+Sampling restrictions: **top-k** keeps the k highest-probability tokens before sampling; **top-p (nucleus)** keeps the smallest set whose cumulative probability exceeds p (e.g. 0.9). Both prune the long tail of garbage tokens.
+</SideNote>
+
+The diagram above shows the top-5 candidates after softmax for the *first* response token after our dark-mode prompt: `"I"` at 61%, `"Looking"` at 18%, `"Let"` at 9%, `"To"` at 5%, `"First"` at 3%. With T ≈ 0, `"I"` wins. Detokenize: integer ID 40 → the literal character `I`. That's the first output token. Then loop: feed `"I"` back through the 80-layer stack — but only `"I"`, because the KV cache below still holds everything else.
+
+### 10. Streaming back — SSE token by token
+
+<RequestPath station="10" />
+
+The instant a token is sampled, it's flushed to your screen via **Server-Sent Events** (SSE) over the same HTTP/2 connection from station 2. There's no buffering for effect — the word-by-word appearance you see is the literal sampler-to-terminal cadence. Each `text_delta` event carries one decoded token. The `cache_read_input_tokens: 49,950` field in the first frame is the prompt-cache hit from station 3, billed at the discounted rate.
+
+<SideNote label="SSE (Server-Sent Events)">
+A one-way streaming protocol over HTTP. Server sends `event:` / `data:` lines; client reads them as a stream. Simpler than WebSockets, sufficient when only the server needs to push.
+</SideNote>
+
+### 11. Tool use — the loop that turns one request into twenty-two
+
+<RequestPath station="11" />
+
+For a chat request, station 10 is the end. For an agent, it's the start of a loop. When the model emits a `tool_use` block (e.g. `Read("app/globals.css")`), the stream closes with `stop_reason: tool_use`. Claude Code parses the tool call, runs it locally, appends the result to the conversation, and fires a **brand new `/v1/messages` request** — back to station 3 (cache hit, route to the same replica), through all 80 layers again, sample a few more tokens, possibly emit another tool call, repeat.
+
+<SideNote label="Stateless">
+Each model forward pass is independent. The model doesn't "remember" anything between requests — the entire conversation history is part of the input on every turn. **The illusion of continuous reasoning is the loop, not the model.**
+</SideNote>
+
+<SideNote label="MCP / tool schemas">
+Model Context Protocol: a JSON description of available tools, included in every request so the model knows what it can call. ~280–320 tokens per tool definition. **A rack of five MCP servers with ~50 tools consumes 30–60K tokens before you've typed anything.**
+</SideNote>
+
+For our four-word dark-mode prompt: ~22 round-trips through the entire eleven-station stack, ~80K tokens of conversation grown over four minutes, ~88% cache hit rate the whole way. Seven files modified, tests passing. The model itself never "ran for four minutes" — it ran for twenty-two forward passes of a few hundred milliseconds each, and the loop in your terminal is what made the time feel continuous.
+
+---
+
+*That's the full trace. The rest of this section is the deeper math behind stations 5 (embedding), 7 (the transformer block), 8 (the KV cache), and the serving techniques that make all of it economic — read on for the numbers an investor needs; skip ahead to **The demand side** if the trace was enough.*
 
 ### Embeddings — what happens when a token first hits the GPU
 
 Before attention, before MLPs, every token takes a trip through the embedding matrix. The tokenizer produces an integer ID; the embedding layer looks up row `ID` of a `vocab_size × hidden_size` table and returns a vector. That vector is the token's entire presence on the GPU from that point on — everything downstream is math on these.
 
 The matrix is bigger than people intuit. **Llama-3 70B:** `vocab_size = 128,256`, `hidden_size = 8,192`. At BF16 that's `128,256 × 8,192 × 2 bytes ≈ 2.10 GB`. Because Llama-3 does *not* tie input and output embeddings, a second matrix of identical size (`lm_head`) sits at the end of the stack — **~4 GB combined** dedicated to embedding lookup and unembedding projection. Under tensor parallelism this gets sharded along the vocab dimension (Megatron's `VocabParallelEmbedding`): at TP=8, each rank holds 16,032 vocab rows × 8,192 cols and an all-reduce (forward embedding) or all-gather (final `lm_head`) sits on the critical path.
+
+<SideNote label="Tensor parallelism (TP)">
+A way to spread one model across multiple GPUs by **slicing each weight matrix across the GPUs** and running pieces of the matmul in parallel. TP=8 means 8 GPUs share the work of every layer. Different from data parallelism (different requests on different GPUs) and pipeline parallelism (different layers on different GPUs).
+</SideNote>
+
+<SideNote label="All-reduce / all-gather">
+Two of the standard collective communication primitives. **All-reduce** sums partial results across all GPUs and gives every GPU the total; **all-gather** concatenates per-GPU shards into the full tensor on every GPU. Both have to finish before the next layer can start — they sit on the critical path of every forward pass.
+</SideNote>
+
+<SideNote label="Tied embeddings">
+A trick from Press & Wolf (2017): use the **same matrix** for both the input embedding (token ID → vector) and the output projection `lm_head` (vector → logits). Saves 2–8 GB per model. Llama-3 doesn't do this; Gemma 2 does, because its 256K vocab makes an untied `lm_head` disproportionately expensive.
+</SideNote>
 
 **Tying matters more than people think.** The "tied embeddings" trick (share weights between input embedding and output projection) was formalized by Press & Wolf (2017). The 2026 pattern across open-weights models: **large models untie, with one important exception.** Llama-3/3.1, DeepSeek-V3, Qwen 2.5 at 7B+, GPT-OSS 120B — all untied (verified from their `config.json` files). The exception is **Gemma 2**, which ties even at 27B — because Gemma's vocab is 256,000 tokens (roughly 2× Llama), making an untied `lm_head` disproportionately expensive. Tying saves ~2–8 GB per model depending on size. For inference servers juggling many models per GPU fleet, that saving adds up.
 
@@ -50,6 +276,10 @@ The matrix is bigger than people intuit. **Llama-3 70B:** `vocab_size = 128,256`
 - **YaRN** (Peng et al., 2023) — the published SOTA for RoPE extension. Per the paper: matches SOTA quality after fine-tuning on under 0.1% of original pretraining tokens, 10× fewer tokens than prior methods. **Not training-free** — a common misconception. Used by DeepSeek-V3 and GPT-OSS 120B.
 - **Meta's "llama3" scaling** for Llama-3.1 128K — a custom frequency-dependent scheme (low-frequency components scaled by factor 8, high-frequency left alone, smooth interpolation between). Shipped with ~800B tokens of gradual continued pre-training in 6 stages, not a fine-tune.
 
+<SideNote label="YaRN">
+"Yet another RoPE eNgineering" — the published state-of-the-art for stretching a model's context window. Combines NTK-aware frequency scaling with a temperature term that recalibrates attention as the context grows. The published cost: fine-tuning on **under 0.1% of original pretraining tokens** to recover quality at the longer context.
+</SideNote>
+
 The investment-relevant fact: **long context is a software extension, not an architectural rebuild.** A lab can ship a 200K-context variant of a trained model by burning under 1% of original pretraining compute on RoPE scaling. This is why context windows keep growing faster than model generations do, and why the KV cache sized below — which scales linearly with context length — dominates HBM for production serving.
 
 ### The KV cache — where long context actually costs
@@ -59,6 +289,18 @@ The KV cache stores the K and V projections for every past token so decode doesn
 This is why:
 
 - **DeepSeek's MLA** (Multi-head Latent Attention) is as important as their MoE. MLA projects K and V into a shared low-rank latent (DeepSeek-V3 uses d_c=512 against a 16,384-wide effective attention space) and reconstructs at attention time. Per-token cache: ~70 KB, vs ~320 KB on a Llama-3-style GQA-8 baseline at comparable dimensions. The DeepSeek-V2 paper reports ~14× compression against MHA — but MHA is the wrong comparison class since every frontier model uses GQA. The **honest framing is ~4× smaller than frontier GQA at matched quality**. The tradeoff: MLA's up-projections burn extra compute per decode step and FlashAttention doesn't support the MLA shape yet, which is why adoption outside DeepSeek has been slow despite ACL 2025 work showing MLA can be retrofitted via distillation.
+
+<SideNote label="MLA (multi-head latent attention)">
+DeepSeek's variant of attention: project K and V down to a **shared low-rank latent** (e.g. 512-dim) and store only that; reconstruct full K and V on the fly per attention step. ~4× smaller KV cache than GQA at matched quality, at the cost of extra compute per decode step.
+</SideNote>
+
+<SideNote label="MHA vs GQA vs MLA">
+The three attention variants that matter today. **MHA** (multi-head): every query head has its own K/V — the 2017 default, now obsolete at scale. **GQA** (grouped-query): query heads share K/V in groups of 4–8 — the frontier default. **MLA**: K/V live in a low-rank shared latent — DeepSeek's invention, ~4× smaller cache.
+</SideNote>
+
+<SideNote label="FlashAttention">
+A family of attention kernels (Dao et al., 2022 → FlashAttention-3, 2024) that compute attention without materializing the full N×N score matrix. Tiles the computation through SRAM. **2–10× faster** than naïve attention and required for long context to be tractable.
+</SideNote>
 - **Anthropic's prompt-caching discount** effectively prices KV-cache residency. Cached input token reads bill at ~10% of base input pricing; cache writes bill at ~125%. Working it through for a 20-turn Claude Code session with a 50K-token stable prefix: turn 1 pays 1.25× on 50K (a write), turns 2–20 pay 0.1× on 50K (reads), plus each turn's small delta at full rate. Amortized input rate drops from $3/M to roughly $0.50/M — the ~6× effective reduction that turns agents from uneconomic to routine. The gotcha: the 1.25× write premium means any inadvertent cache invalidation (a timestamp in the system prompt, tool-result ordering changes, UUID leaks) silently inflates cost 2–5× because you're writing instead of reading. Claude Code's 84–92% cache hit rate is the outcome of aggressive prefix-stability engineering, not a feature that works by default.
 - Google's TurboQuant (Feb 2026) demonstrated lossy KV compression via random rotation plus precomputed Gaussian codebooks. That memory stocks (Micron, Western Digital, SanDisk) sold off meaningfully on publication is widely-observed but the exact daily move is worth checking before citing.
 
@@ -67,6 +309,10 @@ This is why:
 - **INT8 KV cache** — shipping in vLLM (`kv_cache_dtype="fp8_e4m3"` or `"int8"`) and TensorRT-LLM (`--int8_kv_cache` with calibration). 2× smaller than BF16 with minimal quality degradation on standard benchmarks, per both frameworks' docs. Specific perplexity deltas depend on model and task — don't treat "sub-half-percent drift" as a universal figure.
 - **FP8 KV cache** — also in vLLM and TRT-LLM; requires Hopper / Ada / Blackwell. NVIDIA explicitly recommends FP8 over INT8 on Hopper-class hardware because FP8's dynamic range preserves activation outliers better than INT8's linear quantization.
 - **NVFP4 KV on Blackwell** — SM100 (datacenter Blackwell) only today; NVIDIA's own blog reports **50% KV memory reduction versus FP8 at under 1% accuracy loss** using ModelOpt offline calibration, currently paired with FP8 weights. Consumer Blackwell (SM120) support is still an open TRT-LLM issue. This is the lever Blackwell-era inference throughput wins depend on most.
+
+<SideNote label="NVFP4">
+NVIDIA's 4-bit floating-point format introduced with Blackwell. Half the bytes of FP8 with per-tensor scaling that handles outliers. The lever Blackwell-era throughput wins lean on most heavily — half the memory bandwidth per weight or per cached K/V doubles decode throughput on a bandwidth-bound workload.
+</SideNote>
 - **INT4 / 2-bit KV** — research-grade. **KIVI** (Liu et al., ICML 2024) is the notable result: 2-bit asymmetric quantization with per-channel for keys and per-token for values, tuning-free, near-lossless on LongBench / GSM8K per the paper's tables. Not in production serving frameworks as a first-class feature as of this writing.
 
 **Another lever: don't cache what you don't need.** Two classes of technique bound KV size by architecture or eviction rather than compression:
@@ -74,17 +320,49 @@ This is why:
 - **Sliding-window attention** (Mistral 7B, Jiang et al. 2023) restricts each layer's attention to a fixed window — window W=4096 in Mistral, information propagated to tokens outside the window via stacked layers. KV cache per sliding layer is O(W × layers_local) rather than O(seq × layers). Modern mixed-attention designs alternate local and global: Gemma 2 interleaves local (W=4096) and global layers; GPT-OSS 120B's config specifies a mix of `sliding_attention` (W=128) and `full_attention` layers. The design trades off global-context fidelity for a major KV reduction.
 - **Attention sinks / streaming attention** (Xiao et al., ICLR 2024) exploit the observation that the first few tokens of a sequence get outsized attention regardless of content — keeping those "sinks" and evicting middle tokens preserves generation quality far better than naïve windowing. Integrated in TensorRT-LLM and HuggingFace Transformers; vLLM declined to implement ("not planned" per their issue tracker). Whether frontier-lab production stacks use streaming-style eviction is not publicly disclosed.
 
+<SideNote label="Sliding-window attention">
+Each attention layer only looks at the last W tokens, not the full history. KV cache cost stops growing past W. Information about earlier tokens still propagates upward through *stacked* layers — each layer carries forward a summary. Modern designs mix sliding and full-attention layers.
+</SideNote>
+
+<SideNote label="Attention sinks">
+The empirical observation that the **first few tokens** of any sequence absorb a disproportionate share of attention regardless of content. Keeping those tokens in the KV cache (and evicting middle ones to save memory) preserves quality far better than naïvely keeping only the tail.
+</SideNote>
+
 PagedAttention works for the same reason DRAM controllers prefer reads from already-open rows, the same reason SSDs use super-pages striped across chips, and the same reason hard drives need defragmenting: at every layer of the memory hierarchy, the cost of an access is dominated by getting to the data, not reading it. Software that arranges related data spatially — same DRAM row, same flash page, same disk track — pays the move once and amortizes it across many reads. Most of what looks like architectural diversity below the application layer is one principle in different geometry.
 
 ### Mixture of Experts — sparse activation and why it benchmarks differently
 
 Every frontier model released since mid-2024 is a Mixture of Experts. DeepSeek V3 (December 2024) has 671B total parameters but only 37B activate on any given token. Llama 4 Maverick (April 2025) has 400B total / 17B active across 128 routed experts plus 1 shared expert. GPT-OSS 120B (OpenAI's open release) has ~117B total / 5.1B active across 128 experts. Qwen3-235B-A22B — the naming convention "A22B" = 22B activated — has 22B active over 128 experts. Only Anthropic hasn't confirmed Opus's architecture either way.
 
+<SideNote label="Mixture of Experts (MoE)">
+Replace each transformer layer's single MLP with **N parallel experts** (each a smaller MLP) plus a tiny router network. The router scores all experts per token, picks top-K, and only those K run. **Total parameters scale with N; compute scales with K.** Cheaper per token at the cost of much bigger HBM footprint.
+</SideNote>
+
+<SideNote label="Active vs total parameters">
+**Total** = all expert weights that have to be resident in HBM (the router might pick any of them on the next token). **Active** = only the K experts that actually compute for this token. The naming convention "A22B" = 22B active; "235B-A22B" means 235B total with 22B active.
+</SideNote>
+
 The mechanics: each transformer layer replaces its single feedforward MLP with N parallel experts plus a small router network. For every token, the router scores all experts, picks top-K, and only those K experts do the forward pass. DeepSeek-V3 uses top-8 of 256 routed experts plus 1 shared expert (9 total active per token). Llama 4 Maverick uses top-1 of 128 routed plus 1 shared (2 total). GPT-OSS 120B uses top-4. The Mixture of Experts Layer goes back to Shazeer et al. 2017 ("Outrageously Large Neural Networks," arXiv:1701.06538); Switch Transformer (Fedus, Zoph, Shazeer 2021, arXiv:2101.03961) simplified it to top-1 routing; Mixtral 8x7B (arXiv:2401.04088) brought the pattern to the open-weight frontier with top-2 of 8.
 
 **The asymmetry is the whole point and the whole problem.** HBM capacity cost scales with total parameters — every expert has to be resident somewhere in the inference fleet because routing decisions are per-token and unpredictable. Compute cost scales with active parameters — only the K selected experts run per token. So a 671B DeepSeek V3 holds ~1.3 TB of weights in HBM at BF16 but does roughly the FLOP count of a 37B dense model per forward pass. This is great for tokens-per-second-per-watt and terrible for single-box deployability.
 
 **How experts actually get served: expert parallelism.** You can't fit 256 experts on one GPU, so each GPU holds a subset of experts and every decode step involves an **all-to-all** communication — each token's router output tells the system which GPU has the expert it needs, and activations get shuffled across the pool. This is why NVL72 matters disproportionately for MoE: 72 GPUs inside a single NVLink domain mean the all-to-all traffic stays on 1.8 TB/s NVLink rather than crossing 400 Gbps InfiniBand. SGLang's large-scale EP deployment (12 nodes × 8 H100 = 96 H100s) serving DeepSeek-R1 reports **52.3K input tokens/sec and 22.3K output tokens/sec per node** on 2,000-token prompts — a per-8-GPU-node figure, not a per-GPU figure. NVIDIA's own wide-EP benchmarks on GB300 NVL72 show SGLang on DeepSeek-R1 up to ~25× the H200 throughput at matched latency.
+
+<SideNote label="Expert parallelism (EP)">
+Spread the experts of an MoE across multiple GPUs. Each GPU holds a subset of experts. Every decode step requires shuffling each token's activations to the GPU that owns the expert the router chose for it (and back).
+</SideNote>
+
+<SideNote label="All-to-all">
+A collective where every GPU sends a different chunk of data to every other GPU. The standard primitive for expert-parallel MoE serving. Its latency is the dominant cost of MoE decode — which is why staying inside one NVLink domain (NVL72) matters disproportionately.
+</SideNote>
+
+<SideNote label="NVL72 / NVLink domain">
+NVIDIA's rack-scale topology: **72 GPUs** wired into a single NVLink switch fabric at ~1.8 TB/s per GPU. Inside that domain, all-to-all is ~50× faster than over InfiniBand between racks. NVL72 is why Blackwell-era MoE benchmarks blow out the previous generation — the model fits inside one copper domain.
+</SideNote>
+
+<SideNote label="InfiniBand">
+The conventional inter-server fabric for HPC and AI clusters. Typically 400–800 Gbps per port today. Roughly **20× slower than NVLink** per GPU. Cross-rack collectives go over IB; intra-rack stay on NVLink.
+</SideNote>
 
 **This is where the "~100× H100" InferenceMAX numbers come from.** The headline wins SemiAnalysis publishes — Blackwell/Rubin-class racks multiplying H100 throughput on specific benchmarks — are mostly MoE scenarios where NVL72 scale-up lets the all-to-all stay inside copper. For dense non-MoE models (Llama-3 70B, Qwen 72B), the generational uplift on the same benchmark collapses to a much smaller range. When a vendor reports a headline ratio, the first question to ask is: *which model, which interactivity point, which precision, MoE or dense?*
 
@@ -97,10 +375,42 @@ The investment-relevant collapse of this section: **MoE is why hardware benchmar
 A large fraction of the token-price decline over the last three years is software, not silicon. The load-bearing techniques:
 
 - **Continuous batching / iteration-level scheduling (Orca, OSDI '22).** The scheduling granularity is one decode step, not one request — every iteration, new requests admit into free batch slots, finished requests evict immediately, and prefill for newcomers interleaves with decode for everyone else. The non-trivial engineering is *selective batching*: attention has to be per-request (each holds its own KV), but MLP matmuls cross-request batch because they're all multiplying the same weight matrix by different activations. Orca reported 36.9× throughput at matched p50 latency versus pipeline-parallel FasterTransformer on GPT-3 175B.
+
+<SideNote label="Continuous batching">
+Don't wait for a request to finish before adding the next one to the batch. Every decode step, evict finished requests and admit new ones into their slots. Pre-Orca systems re-batched at request boundaries and wasted most of the GPU on stragglers. **36.9× throughput win** at matched p50 latency over the previous default.
+</SideNote>
 - **PagedAttention (vLLM, SOSP '23).** KV cache as OS virtual memory — chunked into fixed-size blocks (16 tokens typical, ~80 KB each on Llama-70B), each request holds a block table mapping logical positions to physical blocks, sequences grow by grabbing from a global pool, shared prefixes point to the same physical blocks with refcounts and copy-on-write. External fragmentation goes to zero by construction. The vLLM paper reports KV waste falling from 60–80% to under 4% and 2–4× throughput over prior systems on realistic traces. The attention kernel has to do a block-table lookup per K/V read — FlashAttention-3 and FlashInfer now ship native paged-KV support with `<5%` overhead vs contiguous.
 - **Speculative decoding.** A cheap draft model proposes k candidate tokens; the target model verifies them in one parallel forward pass (essentially the same cost as one decode step, because decode is bandwidth-bound). Expected speedup is `(1 − α^(k+1))/(1 − α)` where α is per-token acceptance rate — k=5, α=0.7 gives ~2.4×. Costs HBM (draft weights + parallel KV) and falls apart above ~batch 32 when the target's decode stops being bandwidth-bound. EAGLE-3 (NeurIPS '25) sidesteps the memory cost by reusing the target's own intermediate features; it's become the production default in stacks that ship spec-decoding.
+
+<SideNote label="Speculative decoding">
+A small "draft" model proposes k future tokens cheaply. The big target model verifies all k in one parallel forward pass (decode is bandwidth-bound, so verifying k tokens costs ~the same as decoding one). Accepted tokens are free; rejected ones fall back. **~2× speedup** at typical acceptance rates.
+</SideNote>
 - **Disaggregated serving** (DistServe, Splitwise, Mooncake). Run prefill and decode on separate pools; ship KV cache between them. The two SLAs this optimizes: **TTFT (time to first token)** — how long the user waits before streaming starts, dominated by prefill — and **TPOT (time per output token)** — the inter-token cadence the user experiences, dominated by decode. Chat SLAs want both small simultaneously; colocating prefill and decode on the same GPU pool forces a compromise. A 2K-token Llama-70B prefill produces ~620 MB of cache that has to move to the decode GPU — roughly 12 ms on 400 Gbps RDMA, mostly hidden behind the first decode step; roughly 50 ms on 100 Gbps, which does hurt TTFT. This is the concrete mechanism linking inference architecture to optical-networking demand, not just "bigger cluster more fiber." DistServe reports 2–3.4× goodput on chat and code-completion workloads, where **goodput** = throughput meeting both TTFT and TPOT SLAs, not raw tokens/sec.
+
+<SideNote label="Disaggregated serving">
+Run prefill and decode on **separate GPU pools**, ship the KV cache between them. Each pool can be sized for its own bottleneck. Connecting them requires high-bandwidth RDMA between pools — the concrete mechanism linking inference architecture to optical-networking demand.
+</SideNote>
+
+<SideNote label="TTFT / TPOT">
+**TTFT** = time to first token, the latency before streaming starts (dominated by prefill). **TPOT** = time per output token, the streaming cadence the user feels (dominated by decode). Chat SLAs want both small. They pull in opposite directions on a colocated pool, which is why disaggregation pays off.
+</SideNote>
+
+<SideNote label="Goodput">
+Throughput **conditioned on meeting both SLAs simultaneously**. A serving system that hits 100K tokens/sec at 10s TTFT has poor goodput; one that hits 60K tokens/sec at 200ms TTFT has higher goodput. The metric that matters when latency is part of the product.
+</SideNote>
 - **FP4 on Blackwell.** Dropping from FP16 to FP4 halves the bytes per weight twice over, directly buying throughput on a memory-bound workload. The "up to 100×" InferenceMAX number is true but narrow: it's specifically DeepSeek-R1 MoE on GB300 NVL72 at 116 tok/s/user interactivity, against a best-configured H100 FP8 disagg baseline. Decomposed roughly: ~2× from FP8→FP4, ~3–4× from H100→B200 generational uplift, ~3× from 72-GPU NVLink scale-up letting MoE all-to-all stay off InfiniBand, ~2× from MTP, plus superlinear scaling once the whole model fits in one NVLink domain. For dense non-MoE models (Llama-3 70B, Qwen2-72B), the gen-over-gen win collapses to ~3–5×. "100×" is a specific-benchmark claim, not a generic uplift.
+
+<SideNote label="FP4 / FP8 / BF16">
+The dtype ladder for weights. **BF16** = 2 bytes/weight (Hopper-era default). **FP8** = 1 byte/weight (also Hopper, with quality calibration). **FP4** = 0.5 bytes/weight (Blackwell-only). Each halving doubles the maximum decode throughput on a bandwidth-bound workload — at the cost of more aggressive calibration to preserve quality.
+</SideNote>
+
+<SideNote label="MFU (model FLOPs utilization)">
+What fraction of the GPU's peak FLOPs your forward pass actually uses. Prefill on a well-batched workload: ~50–70%. Decode at batch-1: under 1%. Decode at batch-64: ~28%. **MFU is the headline efficiency metric** — every serving technique in this section is a different way to raise it.
+</SideNote>
+
+<SideNote label="FLOPs / byte (arithmetic intensity)">
+The ratio of compute to data movement for a given operation. The **roofline** on H100 is ~295 FLOPs/byte at BF16 — operations above that line are compute-bound, below are bandwidth-bound. Prefill sits well above. Decode at batch-1 sits well below. Batching shifts decode rightward toward the roofline.
+</SideNote>
 
 These headline numbers don't stack multiplicatively — Orca's 36.9× is against FasterTransformer's static-batching baseline; vLLM's 23× is against HuggingFace TGI v0.9 that already had basic continuous batching. But the cumulative effect is visible in actual pricing across three years, and it's the cleanest evidence that efficiency is a real phenomenon, not a narrative.
 
